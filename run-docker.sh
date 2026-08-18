@@ -15,14 +15,43 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-if [ -f "$HERE/.env.docker" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . "$HERE/.env.docker"
-    set +a
-fi
+# Read the key files the way harness.py's load_dotenv() does, rather than
+# sourcing them. This project's own .env is written `FAL_KEY = value`, with
+# spaces, which is fine for a tolerant parser and is a syntax error to the
+# shell - sourcing it ran `FAL_KEY` as a command and reported the key as unset.
+#
+# Anything already exported wins, so `FAL_KEY=... ./run-docker.sh` overrides
+# the file for one run.
+load_env() {
+    local f="$1" line k v
+    [ -f "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        case "$line" in ''|\#*) continue ;; esac
+        [ "${line#*=}" = "$line" ] && continue
+        k="${line%%=*}"; v="${line#*=}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        # An `if`, not `[ -z ... ] && export ...`: the && form evaluates to 1
+        # when the variable is already set, that is the last status in the loop
+        # body, and under `set -e` the script then exits silently - which looks
+        # exactly like the run starting and doing nothing.
+        case "$k" in
+            [A-Za-z_]*)
+                if [ -z "${!k:-}" ]; then
+                    export "$k=$v"
+                fi
+                ;;
+        esac
+    done < "$f"
+}
 
-: "${FAL_KEY:?not set - copy .env.docker.example to .env.docker and add the key}"
+# .env.docker first so it can override the .env the native run.sh path uses.
+load_env "$HERE/.env.docker"
+load_env "$HERE/.env"
+
+: "${FAL_KEY:?not set - put FAL_KEY in .env or .env.docker}"
 
 # The model servers answer without real auth, but vision.py and
 # match_reference.py exit when the variable is unset entirely, so the harness's
