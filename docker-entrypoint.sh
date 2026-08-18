@@ -92,21 +92,65 @@ RC=$?
 # always leaves the logs that explain what went wrong.
 shopt -s nullglob
 PICKS=("$RUN_DIR"/output/*.png "$RUN_DIR"/output/*.jpg)
-if [ ${#PICKS[@]} -gt 0 ]; then
-    cp -p "${PICKS[@]}" "$OUT_DIR"/
+
+# What actually gets delivered. Normally the picks - the agent's shortlist.
+#
+# SHIP_CANDIDATES=1 delivers every generated candidate instead, ordered picks
+# first. That exists for a caller that needs a FIXED-SIZE set: the agent is
+# free to ship three of four when the fourth is a garment the model redrew
+# rather than re-laid, and no instruction reliably overrides that - it read the
+# skill, which says fewer than four is a correct answer, and it is right to.
+#
+# Shipping all of them is only defensible because these are OPTIONS for a
+# person to choose from downstream, not a finished delivery. The grading is not
+# discarded: it becomes the order. Position 1 is the pick the agent defended
+# hardest and the last position is the one it argued against, so a reviewer
+# reading top-down sees its judgement even though nothing was withheld.
+DELIVER=("${PICKS[@]}")
+if [ -n "${SHIP_CANDIDATES:-}" ] && [ -d "$RUN_DIR/archive" ]; then
+    mapfile -t ORDERED < <("$PY" - "$RUN_DIR" <<'PY'
+import pathlib, re, sys
+
+run = pathlib.Path(sys.argv[1])
+cands = {p.stem: p for p in sorted((run / "archive").glob("cand_*.png"))}
+
+# A pick is named pick2_cand_06.png, or pick1_best_cand_10.png for the winner,
+# so the candidate it came from is the trailing cand_NN. Recovering that is
+# what lets the picks lead the ordering without duplicating their bytes.
+ordered, seen = [], set()
+for pick in sorted((run / "output").glob("pick*")):
+    m = re.search(r"(cand_\d+)$", pick.stem)
+    if m and m.group(1) in cands and m.group(1) not in seen:
+        seen.add(m.group(1))
+        ordered.append(cands[m.group(1)])
+
+ordered += [p for stem, p in cands.items() if stem not in seen]
+for p in ordered:
+    print(p)
+PY
+    )
+    if [ ${#ORDERED[@]} -gt 0 ]; then
+        DELIVER=("${ORDERED[@]}")
+    fi
+fi
+
+if [ ${#DELIVER[@]} -gt 0 ] && [ -z "${OUTPUT_PATTERN:-}" ]; then
+    cp -p "${DELIVER[@]}" "$OUT_DIR"/
 fi
 
 # Flat, positional names for a caller that declared its outputs up front and
-# cannot know what the picks will be called - Kestra's outputFiles is the case
+# cannot know what the files will be called - Kestra's outputFiles is the case
 # this exists for: it fails the task on a name it did not find, and the run
 # folder yields pick1_best_cand_07.png, which no one can predict.
 #
-# The glob above is sorted, and the picks are named pick1..pick4 in grade
-# order, so generated_1 is the best pick rather than an arbitrary one.
+# The original names are deliberately NOT also copied here: six files for three
+# deliverables made a working directory nobody could count, and the run folder
+# still has them under their real names.
 if [ -n "${OUTPUT_PATTERN:-}" ]; then
     n=0
-    for p in "${PICKS[@]}"; do
+    for p in "${DELIVER[@]}"; do
         n=$((n + 1))
+        [ "$n" -gt "$EXPECTED_PICKS" ] && break
         cp -p "$p" "$OUT_DIR/${OUTPUT_PATTERN//\{n\}/$n}"
     done
 
@@ -139,6 +183,10 @@ if [ -n "${OUTPUT_PATTERN:-}" ]; then
         > "$OUT_DIR/result.json" <<'PY'
 import json, sys, pathlib
 run, out, session, n = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+# `picks` is the count the AGENT stood behind, which is the number worth
+# reading downstream. It is deliberately not the number of delivered files:
+# under SHIP_CANDIDATES those differ, and that gap is the useful signal - three
+# picks against four images says the last one was shipped over an objection.
 rec = {"session": session, "picks": n,
        "images": sorted(p.name for p in pathlib.Path(out).glob("generated_*.png"))}
 for name, key in (("reference_selection.json", "reference"),
@@ -162,14 +210,20 @@ for f in steps.log LOG.md transcript.jsonl reference_selection.json \
 done
 
 echo
-echo "  delivered ${#PICKS[@]} image(s) to $OUT_DIR"
+echo "  delivered ${#DELIVER[@]} image(s) to $OUT_DIR"
+if [ -n "${SHIP_CANDIDATES:-}" ]; then
+    # Say it plainly. Under SHIP_CANDIDATES the delivered count no longer means
+    # "images the agent stood behind", and a reviewer who assumes it does is
+    # being told the wrong thing by a number that used to be trustworthy.
+    echo "  of which  ${#PICKS[@]} were picked; the rest ship ranked, unfiltered"
+fi
 echo "  logs      $OUT_DIR/logs"
 
 # Shipping fewer than four is a legitimate outcome - the skill says so, and
 # padding the list would be worse. But it is never the outcome you asked for,
 # so it must not exit 0 and read as success in a pipeline.
-if [ ${#PICKS[@]} -lt "$EXPECTED_PICKS" ]; then
-    echo "entrypoint: expected $EXPECTED_PICKS picks, got ${#PICKS[@]}." >&2
+if [ ${#DELIVER[@]} -lt "$EXPECTED_PICKS" ]; then
+    echo "entrypoint: expected $EXPECTED_PICKS images, got ${#DELIVER[@]}." >&2
     echo "  See $OUT_DIR/logs/steps.log and LOG.md for what the run decided." >&2
     [ "$RC" -eq 0 ] && RC=3
 fi
