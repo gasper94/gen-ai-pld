@@ -41,6 +41,11 @@
   outputFiles:
     - result.json
     - used_prompt.txt
+    # Collected so a failed run explains itself. The entrypoint creates both
+    # empty when the run did not get far enough to write them, so declaring
+    # them here can never be the reason a task fails.
+    - steps.log
+    - LOG.md
     - generated_1.png
     - generated_2.png
     - generated_3.png
@@ -60,6 +65,15 @@
     # Renames the picks to the positional names declared above. Without it the
     # run yields pick1_best_cand_07.png, which outputFiles cannot predict.
     OUTPUT_PATTERN: "generated_{n}.png"
+    # Without this the agent follows the skill's own goal, which is "up to 4"
+    # and says outright that fewer than 4 is a correct answer - a first run
+    # shipped 2 and failed the task on the two files it did not write. --ship 4
+    # takes the top 4 by grade whatever their status, which is the fixed-size
+    # set upload-to-spaces requires. Kept in an env var so the quoting cannot
+    # be mangled on its way through YAML into a shell.
+    LAYDOWN_TASK: >-
+      Follow the skill, but generate all 10 images in one call at 2K, then
+      deliver with grade_flats.py --ship 4. remove all pins important prompt.
   entryPoint: ["/bin/bash", "-c"]
   commands:
     - |
@@ -67,4 +81,5 @@
       # Kestra stages inputFiles into the working directory and collects
       # outputFiles from it, so the harness delivers there rather than to /out.
       export OUT_DIR="$PWD"
-      exec /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg"
+      exec /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" \
+          --task "$LAYDOWN_TASK"

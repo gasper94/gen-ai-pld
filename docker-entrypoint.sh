@@ -120,6 +120,18 @@ if [ -n "${OUTPUT_PATTERN:-}" ]; then
             > "$OUT_DIR/used_prompt.txt"
     fi
 
+    # steps.log and LOG.md flat at the top level, and created empty when the
+    # run never wrote them. A caller that collects files by name cannot reach
+    # into logs/, and the one run that most needs explaining - the one that
+    # shipped nothing - is exactly the run that produces neither file.
+    for f in steps.log LOG.md; do
+        if [ -e "$RUN_DIR/$f" ]; then
+            cp -p "$RUN_DIR/$f" "$OUT_DIR/$f"
+        else
+            : > "$OUT_DIR/$f"
+        fi
+    done
+
     # A machine-readable receipt for the same reason: the caller declared
     # result.json and a missing file fails the task, so it is written whatever
     # happened, including on a run that shipped nothing.
