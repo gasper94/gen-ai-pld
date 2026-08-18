@@ -2,6 +2,7 @@
 # neither has ever been committed, and neither should be. .env holds FAL_KEY,
 # which bills real money, and .qwen_key is the model server's API key.
 .env
+.env.docker
 .qwen_key
 
 # The virtualenv. requirements.txt pins the exact versions it was built from,
