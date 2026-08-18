@@ -1,0 +1,7 @@
+# Pinned to the versions of the env3.10 interpreter this project was developed
+# against, so a rebuilt venv behaves identically.
+numpy==2.2.6
+pillow==12.2.0
+scipy==1.15.3
+requests==2.33.1
+fal_client==1.0.0

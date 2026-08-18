@@ -1,0 +1,1347 @@
+#!/usr/bin/env python3
+"""
+harness.py - a very small Claude-Code-style agent loop driven by a local model.
+
+Points a tool-using agent loop at an OpenAI-compatible endpoint (llama.cpp or
+vLLM), loads a SKILL.md as its operating manual, and lets it work in a
+workspace until it calls finish() or hits the iteration cap.
+
+    ./run.sh --skill laydown-match
+    ./run.sh --skill laydown-match --task "Run stage 1 only and report the numbers"
+    ./run.sh --task "Summarise what is in this folder" --max-iters 5
+
+Design notes worth knowing before you edit this file:
+
+  * The model is a *reasoning* model. Replies arrive split across a
+    chain-of-thought field and `content` (the actual answer). llama.cpp calls
+    that field `reasoning_content` and vLLM calls it `reasoning`; both are read.
+    A stingy max_tokens returns content="" and finish_reason="length", which
+    looks like a crash but is just truncation mid-thought. See call_model().
+
+  * The context window is read off the server at startup, not assumed - see
+    preflight(). It has been both 32768 (llama.cpp) and 262144 (vLLM) on this
+    project, and every budget here scales off it. Tool results are still
+    truncated on the way in (full text always spooled to disk), and history is
+    compacted past COMPACT_FRACTION of the window. See Session.compact().
+
+  * Prior-turn reasoning is dropped from history. Keeping it is what makes
+    naive local-model agent loops fall over at turn ~6.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+HERE = Path(__file__).resolve().parent
+
+def _base_url() -> str:
+    """The server root, without the /v1 suffix this file appends itself.
+
+    The endpoint gets pasted around in both forms - vision.py wants it WITH
+    /v1, this file builds /v1/chat/completions itself - so accept either and
+    normalise, rather than producing /v1/v1/chat/completions from a perfectly
+    reasonable QWEN_BASE_URL.
+    """
+    url = os.environ.get("QWEN_BASE_URL", "http://10.11.245.41:8091").rstrip("/")
+    return url[:-3].rstrip("/") if url.endswith("/v1") else url
+
+
+BASE_URL = _base_url()
+API_KEY = os.environ.get("QWEN_API_KEY", "pick-a-long-secret-string")
+
+# Fallback only. The real window is read off the server at startup - see
+# preflight(). Hardcoding it was wrong the moment the endpoint moved: the old
+# llama.cpp box served 32768 and the current vLLM one serves 262144, so a stale
+# constant meant compacting away tool output at 21k with 240k still free, and
+# printing a context percentage that was off by 8x.
+N_CTX_FALLBACK = 32768
+MAX_TOKENS = 3000        # generation budget per turn; reasoning eats most of it
+COMPACT_FRACTION = 0.64  # compact history once the prompt passes this much of N_CTX
+TEMPERATURE = 0.3
+REQUEST_TIMEOUT = 900    # seconds; a long reasoning turn on a 35B model is slow
+RECONNECT_BUDGET = 600   # keep a run alive across a sleeping laptop / Wi-Fi blip
+RECONNECT_POLL = 10
+
+MAX_TOOL_CHARS = 4000    # per tool result fed back to the model
+BASH_TIMEOUT = 900
+
+# Tools that only observe. These never prompt for approval.
+READONLY_TOOLS = {"read_file", "view_image", "compare_images", "finish"}
+
+# Refused outright, in any mode. Not a security boundary - a guardrail against
+# an agent that has decided rm -rf is the shortest path to a clean workspace.
+BASH_DENY = [
+    (r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf]", "recursive/forced rm"),
+    (r"\bmkfs\b|\bdd\s+if=.*\bof=/dev/", "raw disk write"),
+    (r":\(\)\s*\{.*\};\s*:", "fork bomb"),
+    (r"\bshutdown\b|\breboot\b|\bhalt\b", "power control"),
+    (r"\bgit\s+push\b", "git push"),
+    (r"\bcurl\b[^|]*\|\s*(ba)?sh", "curl pipe to shell"),
+    # Reading the pipeline's own source is never the job, and it has cost three
+    # runs: 44%, 54% and 51% of the context window spent before any real step,
+    # one of them running out of turns after two images. The SKILL says how to
+    # call these; --help covers the rest.
+    (r"\b(cat|head|tail|less|more|bat)\b[^|;]*\b(tools/\S+\.py|harness\.py)",
+     "dumping tool source - use --help, the skill documents these"),
+]
+
+
+def c(code: str, s: str) -> str:
+    """Wrap s in an ANSI colour unless output is redirected."""
+    if not sys.stdout.isatty():
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+
+DIM, BOLD, RED, GRN, YEL, BLU, CYA = "2", "1", "31", "32", "33", "34", "36"
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+def load_dotenv(path: Path) -> dict:
+    """Tolerant .env reader - handles `KEY = value`, quotes, comments."""
+    env = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def child_env(workspace: Path) -> dict:
+    """Environment handed to bash: inherited, plus .env, plus the CA fix.
+
+    Credentials come from the harness's own .env first, then the workspace's,
+    so a workspace elsewhere on disk still gets FAL_KEY without a copy of it
+    sitting next to the images. A workspace .env wins where both define a key.
+
+    The skill calls out that certifi's Mozilla-only bundle rejects the corporate
+    proxy certificate, so point requests at the Homebrew OpenSSL bundle when it
+    is present.
+    """
+    env = dict(os.environ)
+    env.update(load_dotenv(HERE / ".env"))
+    if workspace.resolve() != HERE:
+        env.update(load_dotenv(workspace / ".env"))
+    ca = Path("/opt/homebrew/etc/openssl@3/cert.pem")
+    if ca.exists():
+        env.setdefault("SSL_CERT_FILE", str(ca))
+        env.setdefault("REQUESTS_CA_BUNDLE", str(ca))
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def find_python() -> str:
+    """The interpreter the agent is told to run pipeline scripts with.
+
+    The project .venv first, then the old sibling env3.10, then whatever is
+    running us. Since this project left the Axis tree, a bare `python3` on this
+    machine is Homebrew 3.14 with none of numpy/PIL/scipy installed, so handing
+    that to the agent means it discovers the problem as an ImportError mid-run.
+    """
+    for cand in (HERE / ".venv" / "bin" / "python",
+                 HERE.parent / "env3.10" / "bin" / "python3"):
+        if cand.exists():
+            return str(cand)
+    return sys.executable
+
+
+# ---------------------------------------------------------------------------
+# Model client
+# ---------------------------------------------------------------------------
+
+class ModelError(RuntimeError):
+    pass
+
+
+class ConnectionLost(ModelError):
+    """Server unreachable - as opposed to a bad request it will never accept."""
+
+
+class MalformedToolCall(ModelError):
+    """The model emitted tool-call JSON the server could not parse."""
+
+
+def post(payload: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:500]
+        if e.code == 401:
+            raise ModelError(
+                "401 from the model server. Set QWEN_API_KEY to the key the "
+                "server was started with (--api-key on llama.cpp, "
+                "--api-key on vLLM)."
+            ) from e
+        # llama.cpp 500s when the model's own tool-call JSON will not parse -
+        # almost always a long string argument truncated by max_tokens. That is
+        # a generation accident, not a broken request, so it is worth retrying
+        # with more room. Observed writing a ~6KB markdown file in one call.
+        if e.code == 500 and "parse" in body.lower() and "tool" in body.lower():
+            raise MalformedToolCall(body) from e
+        raise ModelError(f"HTTP {e.code}: {body}") from e
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise ConnectionLost(
+            f"Cannot reach {BASE_URL} ({reason}). Is the model server up, and are "
+            f"you on the same network?"
+        ) from e
+
+
+def server_up(timeout: int = 5) -> bool:
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def wait_for_server() -> bool:
+    """Block until the server answers again, or RECONNECT_BUDGET expires.
+
+    Returns True if it came back. In-memory conversation state is what makes
+    this worth doing: the run can pick up exactly where it left off.
+    """
+    deadline = time.time() + RECONNECT_BUDGET
+    budget = (f"{RECONNECT_BUDGET // 60} min" if RECONNECT_BUDGET >= 60
+              else f"{RECONNECT_BUDGET}s")
+    print()
+    print(c(YEL, f"  server unreachable - waiting up to {budget} for it to come back"))
+    print(c(DIM, "  (wake the machine / restart the server; Ctrl-C to give up)"))
+    while time.time() < deadline:
+        time.sleep(RECONNECT_POLL)
+        if server_up():
+            print("\r" + " " * 48 + "\r", end="")
+            print(c(GRN, "  server is back - resuming\n"))
+            return True
+        left = max(0, int(deadline - time.time()))   # a slow poll can overshoot
+        print(c(DIM, f"    still down, {left//60}m{left%60:02d}s left   "),
+              end="\r", flush=True)
+    print("\r" + " " * 48 + "\r", end="")
+    print(c(RED, "  gave up waiting."))
+    return False
+
+
+def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
+               retries=2) -> dict:
+    """One chat completion, with the reasoning-model truncation trap handled.
+
+    A reasoning model spends tokens on `reasoning_content` before writing any
+    `content`. If the budget runs out mid-thought the reply is
+    content="" / finish_reason="length" - not an error, just a starved turn.
+    Retry once with a bigger budget rather than surfacing an empty answer.
+    """
+    payload = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    last_err = None
+    attempt = 0
+    while True:
+        try:
+            data = post(payload)
+        except MalformedToolCall as e:
+            last_err = e
+            attempt += 1
+            if attempt > retries:
+                raise ModelError(
+                    "The model kept emitting tool-call JSON the server could not "
+                    "parse. This is usually one very large string argument being "
+                    "truncated - have the agent write long files via bash heredoc "
+                    "instead of write_file, or raise MAX_TOKENS."
+                ) from e
+            payload["max_tokens"] = min(int(payload["max_tokens"] * 2), 8000)
+            print(c(YEL, f"  ! malformed tool-call JSON (likely a truncated "
+                         f"argument); retrying at max_tokens="
+                         f"{payload['max_tokens']}"))
+            continue
+        except ConnectionLost as e:
+            # A local server on a laptop sleeps, drops off Wi-Fi, or takes a new
+            # DHCP lease. Losing a 20-turn run to a 30-second blip is worse than
+            # waiting, so keep trying for RECONNECT_BUDGET seconds first.
+            last_err = e
+            if wait_for_server():
+                continue
+            raise
+        except ModelError as e:
+            last_err = e
+            attempt += 1
+            if attempt > retries:
+                raise
+            time.sleep(2 * attempt)
+            continue
+
+        choice = data["choices"][0]
+        msg = choice["message"]
+        starved = (
+            choice.get("finish_reason") == "length"
+            and not (msg.get("content") or "").strip()
+            and not msg.get("tool_calls")
+        )
+        if starved and attempt < retries:
+            attempt += 1        # must advance, or a persistently starved turn spins
+            payload["max_tokens"] = min(int(payload["max_tokens"] * 2), 8000)
+            print(c(DIM, f"    (turn starved by token budget; retrying at "
+                        f"max_tokens={payload['max_tokens']})"))
+            continue
+        return data
+
+    raise last_err or ModelError("model call failed")
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": (
+                "Run a shell command in the workspace and return stdout+stderr. "
+                "Use this to run python, inspect files, and do the actual work. "
+                "FAL_KEY and the CA-bundle variables are already set."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a text file. Use offset/limit for large files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "description": "First line, 1-based."},
+                    "limit": {"type": "integer", "description": "How many lines."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a text file with the given content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace the first exact occurrence of old_text with new_text. "
+                "old_text must match the file byte for byte."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": (
+                "LOOK at an image and get a description back. Optionally crop "
+                "first with box='x,y,w,h' in source pixels - use this to inspect "
+                "a seam or a silhouette edge at 1:1 with no resampling. Ask a "
+                "specific question; vague questions get vague answers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "question": {"type": "string", "description": "What to look for."},
+                    "box": {"type": "string", "description": "Optional crop 'x,y,w,h'."},
+                },
+                "required": ["path", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_images",
+            "description": (
+                "LOOK at two images side by side in ONE vision call and get "
+                "the differences back. Use this - not two view_image calls - "
+                "whenever the question is 'how does this differ from the "
+                "reference'. Optionally crop each with box_a/box_b='x,y,w,h' "
+                "in that image's own source pixels."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path_a": {"type": "string", "description": "First image."},
+                    "path_b": {"type": "string", "description": "Second image."},
+                    "question": {"type": "string", "description": "What to compare."},
+                    "box_a": {"type": "string", "description": "Optional crop of A."},
+                    "box_b": {"type": "string", "description": "Optional crop of B."},
+                },
+                "required": ["path_a", "path_b", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": (
+                "Call when the goal is met or you are blocked. Ends the run."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "What you did, with numbers."},
+                    "status": {
+                        "type": "string",
+                        "enum": ["done", "blocked"],
+                        "description": "done if the goal is met, blocked otherwise.",
+                    },
+                },
+                "required": ["summary", "status"],
+            },
+        },
+    },
+]
+
+
+class Tools:
+    def __init__(self, workspace: Path, run_dir: Path, allow_outside: bool):
+        self.ws = workspace
+        self.run_dir = run_dir
+        self.allow_outside = allow_outside
+        self.env = child_env(workspace)
+        self.python = find_python()
+        self._spool = 0
+
+    # -- path handling ----------------------------------------------------
+    def resolve(self, path: str) -> Path:
+        p = Path(path)
+        if not p.is_absolute():
+            p = self.ws / p
+        p = p.resolve()
+        if not self.allow_outside:
+            # Reads outside the workspace are fine (the reference implementation
+            # lives next door); writes are confined by the caller.
+            pass
+        return p
+
+    def _guard_write(self, p: Path):
+        if self.allow_outside:
+            return
+        try:
+            p.relative_to(self.ws)
+        except ValueError:
+            raise PermissionError(
+                f"Refusing to write outside the workspace: {p}\n"
+                f"Workspace is {self.ws}. Re-run with --allow-outside to permit this."
+            )
+
+    def spool(self, name: str, text: str) -> Path:
+        """Write full output to disk so truncation never loses anything."""
+        self._spool += 1
+        p = self.run_dir / "tool_output" / f"{self._spool:03d}_{name}.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    # -- individual tools -------------------------------------------------
+    def bash(self, command: str) -> str:
+        for pat, why in BASH_DENY:
+            if re.search(pat, command):
+                return f"REFUSED: command blocked by harness guardrail ({why})."
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=self.ws, env=self.env,
+                capture_output=True, text=True, timeout=BASH_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return f"TIMEOUT after {BASH_TIMEOUT}s. Command killed."
+        out = (r.stdout or "") + (r.stderr or "")
+        if not out.strip():
+            out = "(no output)"
+        return f"exit={r.returncode}\n{out}"
+
+    SOURCE_GUARD = re.compile(r"(^|/)(harness\.py|tools/[^/]+\.py)$")
+
+    def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> str:
+        if self.SOURCE_GUARD.search(str(self.resolve(path))):
+            return ("REFUSED: that is pipeline source, not an input. The skill "
+                    "documents how to call it and `<script> --help` covers the "
+                    "rest. Three runs have burned ~half their context window "
+                    "reading these before doing any work.")
+        p = self.resolve(path)
+        if not p.exists():
+            return f"ERROR: no such file: {p}"
+        if p.is_dir():
+            return f"ERROR: {p} is a directory. Use bash ls."
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except Exception as e:
+            return f"ERROR reading {p}: {e}"
+        offset = max(1, int(offset or 1))
+        chunk = lines[offset - 1: offset - 1 + int(limit or 2000)]
+        body = "\n".join(f"{offset + i:6d}\t{l}" for i, l in enumerate(chunk))
+        tail = ""
+        if offset - 1 + len(chunk) < len(lines):
+            tail = (f"\n... {len(lines) - (offset - 1 + len(chunk))} more lines. "
+                    f"Re-read with offset={offset + len(chunk)}.")
+        return body + tail
+
+    def write_file(self, path: str, content: str) -> str:
+        p = self.resolve(path)
+        self._guard_write(p)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        existed = p.exists()
+        p.write_text(content)
+        n = len(content.splitlines())
+        return f"{'Overwrote' if existed else 'Wrote'} {p} ({n} lines)."
+
+    def edit_file(self, path: str, old_text: str, new_text: str) -> str:
+        p = self.resolve(path)
+        self._guard_write(p)
+        if not p.exists():
+            return f"ERROR: no such file: {p}"
+        src = p.read_text(errors="replace")
+        if old_text not in src:
+            return ("ERROR: old_text not found. It must match byte for byte, "
+                    "including indentation. Read the file again and copy exactly.")
+        if src.count(old_text) > 1:
+            return (f"ERROR: old_text appears {src.count(old_text)} times and is "
+                    f"ambiguous. Include more surrounding context.")
+        p.write_text(src.replace(old_text, new_text, 1))
+        return f"Edited {p}."
+
+    def _prep_image(self, path: str, question: str, box: str | None):
+        """Crop, downscale and base64 one image for a vision call.
+
+        Returns (b64, note) on success or (None, error_string) - the caller
+        returns that string to the model verbatim.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            return None, (f"ERROR: Pillow not available to the harness "
+                          f"interpreter ({sys.executable}). Run the harness "
+                          f"via ./run.sh.")
+        p = self.resolve(path)
+        if not p.exists():
+            return None, f"ERROR: no such image: {p}"
+        try:
+            im = Image.open(p)
+            im.load()
+        except Exception as e:
+            return None, f"ERROR opening {p}: {e}"
+        src_size = im.size
+        note = f"{p.name} source {src_size[0]}x{src_size[1]}"
+
+        # Asking to "zoom in" without a box gets you the whole frame squeezed to
+        # 1024px - the opposite of a close look. This happened on a real run:
+        # the model called downsampled fabric "real and consistent" while a 1:1
+        # crop showed the knit structure had been destroyed. Refuse instead.
+        zoomish = re.search(r"\b(zoom|close[- ]?up|1:1|pixel|crop|seam|stitch|"
+                            r"fringe|texture|weave|knit)\b", question, re.I)
+        if zoomish and not box and max(src_size) > 1400:
+            return None, (f"REFUSED: '{zoomish.group(0)}' asks for a close look, "
+                          f"but no box was given for {p.name}, so this would "
+                          f"downscale the whole {src_size[0]}x{src_size[1]} "
+                          f"frame to 1024px and show you nothing of the kind. "
+                          f"Pass a box 'x,y,w,h' in source pixels (a few "
+                          f"hundred px wide) to inspect at 1:1.")
+
+        if box:
+            try:
+                x, y, w, h = (int(float(v)) for v in re.split(r"[,\s]+", box.strip()))
+                im = im.crop((x, y, x + w, y + h))
+                note += f", crop @({x},{y}) {w}x{h}"
+            except Exception:
+                return None, "ERROR: box must be 'x,y,w,h' in source pixels."
+
+        # Only downscale when we must. A 1:1 crop is the point of this tool.
+        if max(im.size) > 1024:
+            im.thumbnail((1024, 1024), Image.LANCZOS)
+            note += f", downscaled to {im.size[0]}x{im.size[1]}"
+        else:
+            note += f", sent 1:1 at {im.size[0]}x{im.size[1]}"
+
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "JPEG", quality=92)
+        return base64.b64encode(buf.getvalue()).decode(), note
+
+    @staticmethod
+    def _ask_vision(text: str, b64s: list[str], max_tokens: int = 1200) -> str:
+        """Ask the multimodal model about one or more images.
+
+        max_tokens has to cover the model's REASONING, not just its answer.
+        Measured on this server (Qwen3.6-35B-A3B) on 2026-08-13: a two-image
+        comparison spent 2891 completion tokens, of which ~2750 were reasoning,
+        to emit a 138-token answer. At 1200 the reasoning never terminates,
+        finish_reason comes back "length", and content is empty - the starvation
+        retry doubles once to 2400 and still falls short, so the call returns
+        nothing at all. One image is far cheaper; two need the bigger budget.
+        """
+        content = [{"type": "text", "text": text}]
+        content += [{"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b}"}}
+                    for b in b64s]
+        try:
+            data = call_model([{"role": "user", "content": content}],
+                              tools=None, max_tokens=max_tokens,
+                              temperature=0.1, retries=1)
+        except ModelError as e:
+            return f"ERROR from vision call: {e}"
+        choice = data["choices"][0]
+        answer = (choice["message"].get("content") or "").strip()
+        if answer:
+            return answer
+        if choice.get("finish_reason") == "length":
+            return ("(the vision model used its whole token budget on reasoning "
+                    "and emitted no answer - ask a narrower question, or crop "
+                    "to the detail in question with a box)")
+        return "(model returned nothing)"
+
+    def view_image(self, path: str, question: str, box: str | None = None) -> str:
+        """Send an image to the multimodal model and return what it sees."""
+        b64, note = self._prep_image(path, question, box)
+        if b64 is None:
+            return note
+        answer = self._ask_vision(
+            f"{question}\n\nAnswer concretely in a few sentences. "
+            f"If you cannot tell, say so rather than guessing.", [b64])
+        return f"[{note}]\n{answer}"
+
+    def compare_images(self, path_a: str, path_b: str, question: str,
+                       box_a: str | None = None,
+                       box_b: str | None = None) -> str:
+        """Put two images in ONE vision call and ask how they differ.
+
+        Two separate view_image calls cannot do this. Each describes its own
+        frame in its own words, and the difference between two descriptions is
+        not a comparison - "centred" from one call and "roughly centred" from
+        another says nothing about whether the two garments overlay. Judging
+        placement, scale, symmetry or proportion against a reference needs both
+        frames in front of the model at once.
+
+        Both images get their own 1024px budget, so this is also sharper than
+        viewing a side-by-side contact sheet, where each half arrives at ~512px.
+        """
+        a = self._prep_image(path_a, question, box_a)
+        if a[0] is None:
+            return a[1]
+        b = self._prep_image(path_b, question, box_b)
+        if b[0] is None:
+            return b[1]
+        name_a, name_b = self.resolve(path_a).name, self.resolve(path_b).name
+        answer = self._ask_vision(
+            f"You are given two images. The FIRST is {name_a}. The SECOND is "
+            f"{name_b}.\n\n{question}\n\nAnswer concretely in a few sentences, "
+            f"naming which image each observation is about. Describe only "
+            f"differences you can actually see; if you cannot tell, say so "
+            f"rather than guessing.", [a[0], b[0]], max_tokens=4000)
+        return f"[1st: {a[1]}]\n[2nd: {b[1]}]\n{answer}"
+
+    def finish(self, summary: str, status: str = "done") -> str:
+        return json.dumps({"status": status, "summary": summary})
+
+    def dispatch(self, name: str, args: dict) -> str:
+        fn = getattr(self, name, None)
+        if fn is None or name not in {s["function"]["name"] for s in TOOL_SPECS}:
+            return f"ERROR: no such tool '{name}'."
+        try:
+            return fn(**args)
+        except TypeError as e:
+            return f"ERROR: bad arguments for {name}: {e}"
+        except PermissionError as e:
+            return f"REFUSED: {e}"
+        except Exception as e:
+            return f"ERROR in {name}: {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Approval
+# ---------------------------------------------------------------------------
+
+class Approver:
+    def __init__(self, yolo: bool):
+        self.yolo = yolo
+        self.always = set()
+
+    def ok(self, name: str, args: dict) -> tuple[bool, str]:
+        if self.yolo or name in READONLY_TOOLS or name in self.always:
+            return True, ""
+        if not sys.stdin.isatty():
+            return False, ("Denied: harness is not interactive and --yolo was not "
+                           "passed, so mutating tools cannot be approved.")
+        preview = args.get("command") or args.get("path") or ""
+        print(c(YEL, f"\n  approve {name}?") + f"  {preview[:200]}")
+        try:
+            ans = input(c(DIM, "    [y]es / [n]o / [a]lways this tool / [q]uit > ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False, "Denied by user."
+        if ans in ("a", "always"):
+            self.always.add(name)
+            return True, ""
+        if ans in ("y", "yes", ""):
+            return True, ""
+        if ans in ("q", "quit"):
+            raise KeyboardInterrupt
+        return False, "Denied by user. Try a different approach or ask for guidance."
+
+
+# ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
+
+SYSTEM = """\
+You are a focused engineering agent working in a real workspace on a real \
+machine. You have tools; use them. Do not describe what you would do - do it, \
+then report what actually happened.
+
+Workspace: {ws}
+Python with numpy/PIL/scipy: {python}
+Today: {today}
+
+# Workspace inventory
+
+These are the real files, fingerprinted at startup. They are the inputs you are
+being asked about - not any similarly-named file elsewhere on this machine.
+
+{inventory}
+
+{skill_block}
+
+# The goal
+
+{task}
+
+# How to work
+
+- Take ONE step at a time. Call a tool, read the result, then decide the next step.
+- Ground every claim in output you actually saw. Never report a number you did
+  not measure or a file you did not create.
+- NEVER rely on another program's default arguments. Pass every input and output
+  path explicitly, as an absolute path. A script that defaults its inputs will
+  happily process files from its own directory instead of this workspace, and
+  produce real, precise, entirely wrong numbers. Matching file names and even
+  matching image dimensions do NOT prove you processed the right file - check
+  the fingerprints in the inventory above.
+- Before you report a result, confirm it derives from the workspace inputs. If
+  you produced an image, view_image it and check the subject is what the
+  inventory says it should be.
+- Prefer small, checkable steps over one large script. When something fails,
+  read the error before changing anything.
+- Numbers are not proof on their own. When the work is visual, call view_image
+  and LOOK before declaring success. When the question is how one image differs
+  from another, use compare_images - it puts both in a single vision call. Two
+  separate view_image calls give you two independent descriptions, and the gap
+  between two descriptions is not a measured difference.
+- Keep tool output small. Print the few numbers you need, not whole arrays;
+  pipe long output through head, grep or wc.
+- write_file is for short files. Anything long - a report, a README - must be
+  written with bash and a quoted heredoc, appending section by section. A big
+  string argument gets truncated mid-JSON and the whole call is rejected.
+- When the goal is met - or you are genuinely blocked - call finish() with a
+  summary containing the concrete numbers you measured.
+
+You have a limited context window. Be economical: it is the scarcest resource
+you have, and a run that fills it ends before the work does.
+"""
+
+
+SKIP_DIRS = {"runs", ".git", "__pycache__", "node_modules", ".venv",
+             "output", "notes",
+             # 45 reference photos the agent must not choose between. The
+             # reference is picked before the first turn by
+             # tools/select_reference.py and installed into inputs/; listing the
+             # library as well invites a second, hand-picked opinion and would
+             # eat the whole inventory at 8 files per folder.
+             "library_reference"}
+
+# No single folder may occupy more than this much of the listing. A bulk asset
+# directory otherwise crowds out the files the run is actually about.
+PER_DIR = 8
+
+
+def build_inventory(ws: Path, limit: int = 60) -> str:
+    """Fingerprint the workspace so the agent can tell its inputs apart.
+
+    This exists because of a real failure: an agent ran a neighbouring script
+    with default arguments, processed that script's own same-named, same-sized
+    images, and reported precise measurements of the wrong photograph. Names and
+    dimensions were identical; only the content differed. Hence the md5.
+
+    Two things make the listing useless if they are not handled, and both have
+    happened:
+
+      * Hidden DIRECTORIES were not pruned - only files whose own name began
+        with a dot. `.cache/` sorts ahead of everything and its scratch files
+        are not themselves hidden, so a populated cache filled all 40 slots and
+        the agent's inventory contained no inputs at all. It then spent two
+        turns running `ls` to find files the inventory was supposed to name.
+
+      * One folder can still crowd out the rest. Garment_Library holds 26 PSDs
+        that are not inputs to a laydown run; unbounded they take nearly half
+        the listing. Hence PER_DIR, which truncates per folder and says so, so
+        the agent knows more exist without being shown all of them.
+    """
+    import hashlib
+    from collections import defaultdict
+
+    def describe(p: Path, rel: Path) -> str:
+        extra = ""
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}:
+            try:
+                from PIL import Image
+                with Image.open(p) as im:
+                    dims = f"{im.size[0]}x{im.size[1]}"
+                digest = hashlib.md5(p.read_bytes()).hexdigest()[:8]
+                extra = f"  {dims}  md5:{digest}"
+            except Exception:
+                extra = "  (unreadable image)"
+        return f"  {str(rel):46s} {p.stat().st_size/1e6:7.2f} MB{extra}"
+
+    # Grouped by folder so the "N more" note sits with the folder it describes
+    # rather than at the end of the listing, where it reads as global.
+    groups: dict[str, list[str]] = defaultdict(list)
+    over: dict[str, int] = defaultdict(int)
+    order: list[str] = []
+    n, truncated = 0, False
+    for p in sorted(ws.rglob("*")):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(ws)
+        # Any hidden component, at any depth - not just a hidden basename.
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if set(rel.parts) & SKIP_DIRS:
+            continue
+        if n >= limit:
+            truncated = True
+            break
+        folder = str(rel.parent)
+        if folder not in groups:
+            order.append(folder)
+        if len(groups[folder]) >= PER_DIR:
+            over[folder] += 1
+            continue
+        groups[folder].append(describe(p, rel))
+        n += 1
+
+    rows = []
+    for folder in order:
+        rows += groups[folder]
+        if over[folder]:
+            where = "" if folder == "." else f" in {folder}/"
+            rows.append(f"  … and {over[folder]} more file(s){where}")
+    if truncated:
+        rows.append("  … (listing truncated)")
+    return "\n".join(rows) or "  (empty workspace)"
+
+
+class Session:
+    def __init__(self, task: str, skill_text: str, workspace: Path, run_dir: Path,
+                 tools: Tools, approver: Approver, max_iters: int, verbose: bool,
+                 n_ctx: int = N_CTX_FALLBACK):
+        self.ws = workspace
+        self.run_dir = run_dir
+        self.tools = tools
+        self.approver = approver
+        self.max_iters = max_iters
+        self.verbose = verbose
+        self.n_ctx = n_ctx
+        self.compact_at = int(n_ctx * COMPACT_FRACTION)
+        self.prompt_tokens = 0
+        self.total_completion = 0
+        self.compactions = 0
+
+        skill_block = ""
+        if skill_text:
+            skill_block = (
+                "# Your operating manual\n\n"
+                "The following skill was written from measured experience on this "
+                "exact problem. Its warnings are not theoretical - each one records "
+                "something that already went wrong. Follow it.\n\n"
+                "<skill>\n" + skill_text + "\n</skill>"
+            )
+
+        system = SYSTEM.format(
+            ws=workspace, python=tools.python,
+            today=datetime.now().strftime("%Y-%m-%d"),
+            inventory=build_inventory(workspace),
+            skill_block=skill_block, task=task,
+        )
+        self.messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": task},
+        ]
+        self.pinned = 2  # never compact the system prompt or the goal
+        self.log_path = run_dir / "transcript.jsonl"
+
+    def log(self, kind: str, payload):
+        with self.log_path.open("a") as f:
+            f.write(json.dumps({"t": time.time(), "kind": kind, "data": payload},
+                               default=str) + "\n")
+
+    # -- context management ------------------------------------------------
+    def compact(self):
+        """Reclaim context by eliding the oldest tool results.
+
+        Tool output is where the context actually goes, and the oldest results
+        are the ones the model has already acted on. Elide from the front until
+        we are back under budget; the full text stays on disk either way.
+        """
+        target = self.compact_at * 0.6
+        est = self.prompt_tokens
+        freed = 0
+        for m in self.messages[self.pinned:]:
+            if est - freed < target:
+                break
+            if m.get("role") == "tool" and not m.get("_elided"):
+                freed += len(m.get("content", "")) // 3.5
+                m["content"] = "[earlier tool output elided to reclaim context - " \
+                               "re-run the command if you need it again]"
+                m["_elided"] = True
+        self.compactions += 1
+        self.log("compact", {"freed_est": int(freed), "prompt_tokens": self.prompt_tokens})
+        print(c(DIM, f"  · compacted context (~{int(freed)} tokens reclaimed)"))
+
+    def history(self):
+        """History as the API wants it - private bookkeeping keys stripped."""
+        return [{k: v for k, v in m.items() if not k.startswith("_")}
+                for m in self.messages]
+
+    # -- main loop ---------------------------------------------------------
+    def run(self) -> dict:
+        result = {"status": "max_iters", "summary": "Hit the iteration cap."}
+
+        for i in range(1, self.max_iters + 1):
+            if self.prompt_tokens > self.compact_at:
+                self.compact()
+
+            print(c(BOLD, f"\n[{i}/{self.max_iters}]") + c(DIM, "  thinking..."), end="", flush=True)
+            t0 = time.time()
+            try:
+                data = call_model(self.history(), TOOL_SPECS)
+            except ModelError as e:
+                print()
+                print(c(RED, f"  model error: {e}"))
+                return {"status": "error", "summary": str(e)}
+            dt = time.time() - t0
+
+            choice = data["choices"][0]
+            msg = choice["message"]
+            usage = data.get("usage", {})
+            self.prompt_tokens = usage.get("prompt_tokens", self.prompt_tokens)
+            self.total_completion += usage.get("completion_tokens", 0)
+
+            pct = 100 * self.prompt_tokens / self.n_ctx
+            print("\r" + " " * 40 + "\r", end="")
+            print(c(BOLD, f"[{i}/{self.max_iters}]") +
+                  c(DIM, f"  {dt:.0f}s · ctx {self.prompt_tokens}/{self.n_ctx} ({pct:.0f}%)"))
+
+            self.log("assistant", {"message": msg, "usage": usage})
+
+            think = msg.get("reasoning_content") or msg.get("reasoning")
+            if self.verbose and think:
+                print(c(DIM, textwrap.indent(
+                    textwrap.shorten(think, 600), "    · ")))
+
+            text = (msg.get("content") or "").strip()
+            if text:
+                print(textwrap.indent(text, "  "))
+
+            calls = msg.get("tool_calls") or []
+
+            # Reasoning is dropped from history on purpose - see module docstring.
+            self.messages.append({
+                "role": "assistant",
+                "content": msg.get("content") or "",
+                **({"tool_calls": calls} if calls else {}),
+            })
+
+            if not calls:
+                # No tool, no text: a starved turn. Nudge rather than spin.
+                if not text:
+                    self.messages.append({
+                        "role": "user",
+                        "content": "You returned an empty reply. Take the next "
+                                   "concrete step with a tool, or call finish().",
+                    })
+                    continue
+                self.messages.append({
+                    "role": "user",
+                    "content": "Continue with the next tool call, or call finish() "
+                               "if the goal is met.",
+                })
+                continue
+
+            for call in calls:
+                fn = call["function"]
+                name = fn["name"]
+                raw = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw) if isinstance(raw, str) else raw
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments must be a JSON object")
+                except Exception as e:
+                    out = (f"ERROR: could not parse your tool arguments as JSON "
+                           f"({e}). Send valid JSON.")
+                    self._tool_result(call, out)
+                    print(c(RED, f"  ! bad tool arguments for {name}"))
+                    continue
+
+                self._show_call(name, args)
+
+                if name == "finish":
+                    result = {"status": args.get("status", "done"),
+                              "summary": args.get("summary", "")}
+                    self.log("finish", result)
+                    return result
+
+                allowed, why = self.approver.ok(name, args)
+                out = why if not allowed else self.tools.dispatch(name, args)
+
+                full = out
+                if len(out) > MAX_TOOL_CHARS:
+                    sp = self.tools.spool(name, full)
+                    head = out[: MAX_TOOL_CHARS // 2]
+                    tail = out[-MAX_TOOL_CHARS // 2:]
+                    out = (f"{head}\n\n... [{len(full) - MAX_TOOL_CHARS} chars elided; "
+                           f"full output at {sp}] ...\n\n{tail}")
+
+                self.log("tool", {"name": name, "args": args, "result": full[:20000]})
+                self._show_result(out)
+                self._tool_result(call, out)
+
+        return result
+
+    def _tool_result(self, call, content: str):
+        self.messages.append({
+            "role": "tool",
+            "tool_call_id": call.get("id", ""),
+            "content": content,
+        })
+
+    def _show_call(self, name: str, args: dict):
+        if name == "bash":
+            detail = args.get("command", "")
+        elif name == "finish":
+            detail = args.get("status", "")
+        elif name == "view_image":
+            detail = f"{args.get('path','')} {args.get('box') or ''} - {args.get('question','')}"
+        else:
+            detail = args.get("path", "")
+        detail = " ".join(str(detail).split())
+        print(c(CYA, f"  → {name}") + f"  {detail[:160]}")
+
+    def _show_result(self, out: str):
+        lines = out.splitlines()
+        shown = lines[:8]
+        for l in shown:
+            print(c(DIM, "    " + l[:160]))
+        if len(lines) > len(shown):
+            print(c(DIM, f"    … {len(lines) - len(shown)} more lines"))
+
+
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+def resolve_skill(workspace: Path, name: str | None, skill_file: str | None) -> Path | None:
+    """Find a SKILL.md.
+
+    Order: an explicit --skill-file; skills/<name>/SKILL.md; <name> as a path;
+    and finally a SKILL.md sitting in the workspace root, which is how a skill
+    that lives beside the work it describes gets picked up automatically.
+    """
+    if skill_file:
+        p = Path(skill_file).expanduser()
+        if not p.is_absolute():
+            p = workspace / p
+        if not p.exists():
+            raise SystemExit(f"No such skill file: {p}")
+        return p
+    if name:
+        for cand in (workspace / "skills" / name / "SKILL.md",
+                     Path(name).expanduser(),
+                     workspace / name):
+            if cand.exists() and cand.is_file():
+                return cand
+        avail = sorted(d.name for d in (workspace / "skills").glob("*") if d.is_dir())
+        raise SystemExit(f"No skill '{name}'. Available: {', '.join(avail) or '(none)'}")
+    root = workspace / "SKILL.md"
+    return root if root.exists() else None
+
+
+def load_skill(p: Path) -> tuple[str, str]:
+    """Return (skill_text, description) from a SKILL.md."""
+    text = p.read_text()
+
+    # Pull `description:` out of the frontmatter to seed a default task.
+    desc = ""
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.S)
+    if m:
+        d = re.search(r'^description:\s*"?(.*?)"?\s*$', m.group(1), re.M | re.S)
+        if d:
+            desc = " ".join(d.group(1).split())
+    return text, desc
+
+
+DEFAULT_TASK = (
+    "Accomplish this skill's goal in the workspace, end to end.\n\n"
+    "Start by orienting yourself: list the workspace, identify the input images, "
+    "and check whether a working implementation already exists that the skill "
+    "refers to. Read before you write.\n\n"
+    "Work incrementally and verify each stage with measurements before moving on. "
+    "Anything that costs money must be justified by a measurement first - say what "
+    "you are about to spend and why before you spend it.\n\n"
+    "Write your outputs to a new timestamped folder under runs/ and finish by "
+    "reporting the numbers you measured."
+)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def preflight() -> tuple[str, int]:
+    """Confirm the server is reachable; return (model id, context window).
+
+    vLLM reports `max_model_len` per model on /v1/models; llama.cpp does not,
+    hence the fallback. Reading it beats a constant: this project has already
+    run a 262144-token server while every budget in the file said 32768.
+    """
+    try:
+        req = urllib.request.Request(f"{BASE_URL}/v1/models",
+                                     headers={"Authorization": f"Bearer {API_KEY}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        m = data["data"][0]
+        n_ctx = int(m.get("max_model_len") or N_CTX_FALLBACK)
+        return m["id"], n_ctx
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(
+            f"Cannot reach the model server at {BASE_URL}: {e}\n"
+            f"Start it, or set QWEN_BASE_URL (with or without a /v1 suffix)."
+        )
+
+
+def select_reference(workspace: Path, run_dir: Path, python: str,
+                     category: str | None, threshold: float) -> int:
+    """Step 0: install the lay reference, before the agent gets a turn.
+
+    This is deliberately not the agent's job. Choosing the reference is a
+    judgement with one right answer per garment, it is worth several turns and
+    a lot of context if done conversationally, and it is the input everything
+    downstream is measured against - so it happens once, deterministically,
+    and lands in the workspace inventory as a plain fact by the time the model
+    reads it.
+
+    Returns the child's exit code: 0 installed, 2 no match, 1 broke.
+    """
+    script = workspace / "tools" / "select_reference.py"
+    if not script.exists():
+        print(c(YEL, f"  no {script.name}; skipping reference selection"))
+        return 0
+    cmd = [python, str(script), "--run", str(run_dir),
+           "--threshold", str(threshold)]
+    if category:
+        cmd += ["--category", category]
+    # Flushed: the child writes straight to this terminal, so an unflushed
+    # header appears after everything it was supposed to introduce.
+    print(c(BOLD, "\nstep 0 · reference selection") +
+          c(DIM, "  (deterministic, before the agent starts)"), flush=True)
+    return subprocess.run(cmd, cwd=str(script.parent)).returncode
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="A very small Claude-Code-style agent loop on a local model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              ./run.sh --skill laydown-match
+              ./run.sh --skill laydown-match --task "Run stage 1 only, no API calls"
+              ./run.sh --task "Summarise this folder" --max-iters 5 --yolo
+        """),
+    )
+    ap.add_argument("--skill", help="Skill name under skills/<name>/SKILL.md, or a path.")
+    ap.add_argument("--skill-file", help="Explicit path to a SKILL.md.")
+    ap.add_argument("--task", help="What to do. Defaults to the skill's own goal.")
+    ap.add_argument("--workspace", type=Path, default=HERE)
+    ap.add_argument("--max-iters", type=int, default=40)
+    ap.add_argument("--yolo", action="store_true",
+                    help="Run tools without asking. You are trusting the model with a shell.")
+    ap.add_argument("--allow-outside", action="store_true",
+                    help="Permit writes outside the workspace.")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="Show a slice of the model's reasoning each turn.")
+    ap.add_argument("--no-reference-select", action="store_true",
+                    help="Skip step 0 and run against whatever reference is "
+                         "already sitting in inputs/.")
+    ap.add_argument("--reference-category",
+                    help="Force the library subfolder step 0 searches "
+                         "(e.g. bras, leggings) instead of letting the "
+                         "off-set photo's own garment type pick it.")
+    ap.add_argument("--reference-threshold", type=float, default=90.0,
+                    help="Score a library image must reach to be installed as "
+                         "the reference (default 90).")
+    ap.add_argument("--allow-no-reference", action="store_true",
+                    help="Start the agent even when step 0 found no matching "
+                         "reference. Off by default: the run would be measured "
+                         "against a reference for a different garment.")
+    args = ap.parse_args()
+
+    workspace = args.workspace.resolve()
+    if not workspace.is_dir():
+        raise SystemExit(f"No such workspace: {workspace}")
+
+    skill_path = resolve_skill(workspace, args.skill, args.skill_file)
+    skill_text, skill_desc = load_skill(skill_path) if skill_path else ("", "")
+
+    task = args.task or (DEFAULT_TASK if skill_path else None)
+    if not task:
+        raise SystemExit("Nothing to do: pass --task and/or --skill.")
+    if skill_path and not args.task and skill_desc:
+        task = f"{skill_desc}\n\n{task}"
+
+    model, n_ctx = preflight()
+
+    # One run means one folder, and run.sh stamps it. Deriving a second stamp
+    # here put the transcript and the pipeline's own steps.log in folders that
+    # only agreed because they were a second apart; set it either way so that
+    # calling harness.py directly still gives the tools one folder to share.
+    stamp = os.environ.get("LAYDOWN_SESSION") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.environ["LAYDOWN_SESSION"] = stamp
+    run_dir = workspace / "runs" / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    tools = Tools(workspace, run_dir, args.allow_outside)
+
+    # Step 0, before the Session is built: the inventory in the system prompt is
+    # fingerprinted at construction time, so the reference has to be on disk by
+    # then or the agent is told about the previous garment's one.
+    if not args.no_reference_select:
+        rc = select_reference(workspace, run_dir, tools.python,
+                              args.reference_category, args.reference_threshold)
+        if rc != 0 and not args.allow_no_reference:
+            print(c(RED, "\nstopping before the agent starts."))
+            print(c(DIM, "  No reference was installed, so every measurement "
+                         "downstream would be against the wrong garment."))
+            print(c(DIM, "  --allow-no-reference runs anyway; "
+                         "--no-reference-select uses what is already in inputs/;"))
+            print(c(DIM, "  --reference-category / --reference-threshold widen "
+                         "the search."))
+            return 1
+        if rc != 0:
+            print(c(YEL, "\n  --allow-no-reference: starting with whatever "
+                         "reference inputs/ already holds."))
+
+    approver = Approver(args.yolo)
+    sess = Session(task, skill_text, workspace, run_dir, tools, approver,
+                   args.max_iters, args.verbose, n_ctx)
+
+    print(c(BOLD, "qwen harness"))
+    print(c(DIM, f"  model     {model}"))
+    print(c(DIM, f"  context   {n_ctx} tokens (compacting past {sess.compact_at})"))
+    print(c(DIM, f"  server    {BASE_URL}"))
+    print(c(DIM, f"  workspace {workspace}"))
+    print(c(DIM, f"  skill     {skill_path or '(none)'}"))
+    print(c(DIM, f"  run       {run_dir}"))
+    prov = run_dir / "reference_selection.json"
+    if prov.exists():
+        r = json.loads(prov.read_text())
+        print(c(DIM, f"  reference {Path(r['installed']).name}  <- "
+                     f"{Path(r['source']).name}  ({r['score']}/100)"))
+    print(c(DIM, f"  approval  {'OFF (--yolo)' if args.yolo else 'on'}"))
+    sess.log("start", {"task": task, "skill": args.skill, "model": model})
+
+    t0 = time.time()
+    try:
+        result = sess.run()
+    except KeyboardInterrupt:
+        print(c(YEL, "\n\ninterrupted."))
+        result = {"status": "interrupted", "summary": "User interrupted the run."}
+
+    dt = time.time() - t0
+    colour = {"done": GRN, "blocked": YEL}.get(result["status"], RED)
+    print("\n" + c(BOLD, "─" * 60))
+    print(c(colour, f"{result['status'].upper()}") +
+          c(DIM, f"  ·  {dt/60:.1f} min  ·  {sess.total_completion} tokens generated"
+                 f"  ·  {sess.compactions} compactions"))
+    if result.get("summary"):
+        print("\n" + textwrap.indent(textwrap.fill(result["summary"], 76), "  "))
+    print(c(DIM, f"\n  transcript: {sess.log_path}"))
+
+    sess.log("end", {"result": result, "seconds": dt})
+    return 0 if result["status"] == "done" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

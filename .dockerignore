@@ -1,0 +1,27 @@
+# Keep secrets, host-specific state and bulk data out of the build context.
+#
+# .env and .qwen_key are credentials - they are passed in at `docker run` time
+# with -e, never baked into a layer, because an image layer is readable by
+# anyone who can pull the image.
+.env
+.qwen_key
+
+# The macOS venv. The image builds its own Linux one at the same path.
+.venv/
+
+# Host state. inputs/ is bind-mounted, runs/ is written at run time, and
+# .cache/ is a named volume so the refmatch attribute cache survives.
+inputs/
+runs/
+.cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Bulk archives - 28MB of inputs.zip has no business in an image layer.
+*.zip
+
+.DS_Store
+**/.DS_Store
+.git/
+notes/

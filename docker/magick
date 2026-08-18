@@ -1,0 +1,22 @@
+#!/bin/sh
+# ImageMagick 7 exposes one `magick` entry point; Debian bookworm (what
+# python:3.10-slim is built on) still ships ImageMagick 6, which installs
+# `convert`, `identify`, `montage` and friends as separate binaries and no
+# `magick` at all.
+#
+# The project calls both forms - `magick <file> -resize ...` in
+# match_reference.py and `magick identify -format %@ ...` in grade_flats.py -
+# so dispatch on the first argument: a known subcommand runs that binary, and
+# anything else is the IM7 default of `convert`.
+#
+# Installed only when the base image has no real `magick`; see the Dockerfile.
+case "${1:-}" in
+    identify|convert|mogrify|montage|composite|compare|stream|conjure|import|display|animate)
+        cmd="$1"
+        shift
+        exec "$cmd" "$@"
+        ;;
+    *)
+        exec convert "$@"
+        ;;
+esac

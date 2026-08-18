@@ -1,0 +1,53 @@
+# How to run
+
+./run.sh --skill-file task/SKILL.md
+
+# Step 0 - the reference is picked for you
+
+Every run starts by choosing the lay reference, deterministically, before the
+agent gets a turn:
+
+    tools/match_reference.py    scores all of library_reference/ against
+                                inputs/off_set_image.jpg and returns ONE winner
+                                or an honest "no match"
+    tools/select_reference.py   installs that winner as
+                                inputs/reference_greyscale.jpg (desaturated,
+                                full resolution) and records where it came from
+
+harness.py runs the pair itself. `library_reference/` is kept out of the
+workspace inventory so the agent never sees a second candidate to argue with,
+and the run folder gets:
+
+    runs/<session>/reference_selection.json   source file, score, runner-up,
+                                              and what still differs
+    runs/<session>/match_results.json         every attribute record and score
+    runs/<session>/result_top_matches.jpg     query beside the top 5
+
+**No match stops the run before the agent starts** - a laydown measured against
+the wrong garment's reference is worse than no laydown. Flags:
+
+    --no-reference-select        use whatever reference inputs/ already holds
+    --reference-category bras    force the library subfolder
+    --reference-threshold 85     lower the pass mark (default 90)
+    --allow-no-reference         start anyway, with no match
+
+Or run it by hand:
+
+    cd tools && ../.venv/bin/python select_reference.py --dry-run
+    cd tools && ../.venv/bin/python match_reference.py --list-categories
+
+# What step 0 needs
+
+A vision model on an OpenAI-compatible endpoint - NOT the same server the
+harness uses for its own text model:
+
+    REFMATCH_BASE_URL   default http://10.11.243.169:8080/v1  (include /v1)
+    .qwen_key           the API key, or QWEN_API_KEY in the environment
+
+Deliberately not QWEN_BASE_URL: harness.py reads that one for its text model and
+appends /v1 itself, so sharing the variable pointed one of the two at the wrong
+path.
+
+The attribute cache lives in `.cache/refmatch/`. Cold it costs ~115s for 45
+library images; warm, a run is a few seconds. Deleting it can shift borderline
+scores, because the model re-describes each image - so it is worth keeping.

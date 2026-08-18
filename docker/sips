@@ -1,0 +1,59 @@
+#!/app/.venv/bin/python
+"""A Linux stand-in for the macOS `sips` binary.
+
+tools/vision.py and tools/match_reference.py both downscale through
+`sips -Z <max> <src> --out <dst>` with check=True, so on Linux every vision
+call would die before it sent anything. Shimming the binary keeps the harness
+source identical on macOS and in the container - the alternative was editing
+two tools to call PIL directly, which forks the behaviour of a project that
+still runs natively on the user's Mac.
+
+Only the one flag combination the project actually uses is implemented. Any
+other invocation exits non-zero rather than quietly doing something different,
+because a resize that silently ignored an unknown flag would show up much later
+as an unexplained score change.
+
+`sips -Z` sets the LARGER dimension to the given size and will upscale a
+smaller image to reach it. That is reproduced exactly, rather than using
+PIL's thumbnail() (which only ever shrinks), so a small library image is
+scaled the same way here as on the Mac that produced the cached scores.
+"""
+
+import sys
+from PIL import Image
+
+Image.MAX_IMAGE_PIXELS = None
+
+
+def die(msg: str) -> None:
+    sys.stderr.write(f"sips (container shim): {msg}\n")
+    raise SystemExit(2)
+
+
+def main() -> int:
+    a = sys.argv[1:]
+    if len(a) != 5 or a[0] != "-Z" or a[3] != "--out":
+        die(f"unsupported invocation: {' '.join(a)!r}\n"
+            f"  this shim implements only:  sips -Z <max> <src> --out <dst>")
+
+    try:
+        max_dim = int(a[1])
+    except ValueError:
+        die(f"-Z wants an integer, got {a[1]!r}")
+    src, dst = a[2], a[4]
+
+    im = Image.open(src)
+    im = im.convert("RGB")          # CMYK and P-mode sources cannot save as JPEG
+    w, h = im.size
+    if max(w, h) != max_dim:
+        scale = max_dim / float(max(w, h))
+        im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                       Image.LANCZOS)
+    # sips writes a high-quality JPEG; 92 keeps the compression artefacts below
+    # what the vision model resolves, so descriptions match the macOS run.
+    im.save(dst, "JPEG", quality=92)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

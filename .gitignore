@@ -1,0 +1,36 @@
+# Credentials. Both are read at run time from the environment or these files;
+# neither has ever been committed, and neither should be. .env holds FAL_KEY,
+# which bills real money, and .qwen_key is the model server's API key.
+.env
+.qwen_key
+
+# The virtualenv. requirements.txt pins the exact versions it was built from,
+# so it is reproducible - and it is 164MB of platform-specific binaries that
+# would be wrong on any machine but this one.
+.venv/
+__pycache__/
+*.py[cod]
+
+# Run output. 203MB and growing: every run archives ten ~5MB candidate PNGs
+# plus the picks. The transcript and LOG.md are worth keeping for a run you
+# care about - copy those out rather than committing the folder.
+runs/
+
+# The vision model's attribute cache. Machine-local by design: each entry
+# records the absolute path it was built from, so it does not transfer, and it
+# is rebuilt on demand in about two minutes.
+.cache/
+
+# Working photos. These are per-job, 6-16MB each, and step 0 overwrites
+# inputs/reference_greyscale.jpg on every run - so the folder's contents are
+# run state, not source. The directory itself is kept.
+inputs/*
+!inputs/.gitkeep
+
+# Where the container delivers picks. See DOCKER.md.
+out/
+
+# Bulk archives - inputs.zip alone is 28MB of photos already covered above.
+*.zip
+
+.DS_Store
