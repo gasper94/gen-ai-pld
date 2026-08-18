@@ -1249,9 +1249,21 @@ def main():
                     help="Force the library subfolder step 0 searches "
                          "(e.g. bras, leggings) instead of letting the "
                          "off-set photo's own garment type pick it.")
-    ap.add_argument("--reference-threshold", type=float, default=90.0,
+    # 87, not the matcher's own 90. A periwinkle sports bra scored 89.2 against
+    # a library piece that agreed on garment type, neckline, strap style and
+    # finish and differed only in colour - and colour is the heaviest term in
+    # the score (weight 2.0) while select_reference.py desaturates the winner
+    # before installing it. So the run was stopped by the one attribute the
+    # pipeline throws away. 87 clears a construction-identical, wrong-colour
+    # match and still sits well above the 81.1 band where strap style and
+    # neckline start to disagree.
+    #
+    # Only reference SELECTION moves. match_reference.py keeps 90 for a direct
+    # call, where the caller is asking "is this the same garment?" rather than
+    # "is this close enough in shape to lay against?".
+    ap.add_argument("--reference-threshold", type=float, default=87.0,
                     help="Score a library image must reach to be installed as "
-                         "the reference (default 90).")
+                         "the reference (default 87).")
     ap.add_argument("--allow-no-reference", action="store_true",
                     help="Start the agent even when step 0 found no matching "
                          "reference. Off by default: the run would be measured "

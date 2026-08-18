@@ -28,7 +28,7 @@ the wrong garment's reference is worse than no laydown. Flags:
 
     --no-reference-select        use whatever reference inputs/ already holds
     --reference-category bras    force the library subfolder
-    --reference-threshold 85     lower the pass mark (default 90)
+    --reference-threshold 85     lower the pass mark (default 87)
     --allow-no-reference         start anyway, with no match
 
 Or run it by hand:

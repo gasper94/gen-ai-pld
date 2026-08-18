@@ -121,7 +121,10 @@ def main() -> int:
     ap.add_argument("--category", default=None,
                     help="force a library subfolder instead of letting the "
                          "query's own garment_type pick one")
-    ap.add_argument("--threshold", type=float, default=90.0)
+    # 87 rather than the matcher's 90; see the note in harness.py's
+    # --reference-threshold. harness.py passes this explicitly on every run, so
+    # this default only applies to a direct call of this script.
+    ap.add_argument("--threshold", type=float, default=87.0)
     ap.add_argument("--colour", "--color", dest="colour", action="store_true",
                     help="install the reference in colour; the default "
                          "desaturates it so it cannot act as a colour target")
