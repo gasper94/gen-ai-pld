@@ -96,6 +96,51 @@ if [ ${#PICKS[@]} -gt 0 ]; then
     cp -p "${PICKS[@]}" "$OUT_DIR"/
 fi
 
+# Flat, positional names for a caller that declared its outputs up front and
+# cannot know what the picks will be called - Kestra's outputFiles is the case
+# this exists for: it fails the task on a name it did not find, and the run
+# folder yields pick1_best_cand_07.png, which no one can predict.
+#
+# The glob above is sorted, and the picks are named pick1..pick4 in grade
+# order, so generated_1 is the best pick rather than an arbitrary one.
+if [ -n "${OUTPUT_PATTERN:-}" ]; then
+    n=0
+    for p in "${PICKS[@]}"; do
+        n=$((n + 1))
+        cp -p "$p" "$OUT_DIR/${OUTPUT_PATTERN//\{n\}/$n}"
+    done
+
+    # The prompt the run actually used. archive/prompt.txt is what the agent
+    # sent to fal; the --task string is the fallback when a run died before
+    # writing one, so the field is never empty.
+    if [ -e "$RUN_DIR/archive/prompt.txt" ]; then
+        cp -p "$RUN_DIR/archive/prompt.txt" "$OUT_DIR/used_prompt.txt"
+    else
+        printf '%s\n' "no prompt recorded - the run did not reach generate" \
+            > "$OUT_DIR/used_prompt.txt"
+    fi
+
+    # A machine-readable receipt for the same reason: the caller declared
+    # result.json and a missing file fails the task, so it is written whatever
+    # happened, including on a run that shipped nothing.
+    "$PY" - "$RUN_DIR" "$OUT_DIR" "$LAYDOWN_SESSION" "${#PICKS[@]}" \
+        > "$OUT_DIR/result.json" <<'PY'
+import json, sys, pathlib
+run, out, session, n = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+rec = {"session": session, "picks": n,
+       "images": sorted(p.name for p in pathlib.Path(out).glob("generated_*.png"))}
+for name, key in (("reference_selection.json", "reference"),
+                  ("archive/grade_results.json", "grades")):
+    f = run / name
+    if f.exists():
+        try:
+            rec[key] = json.loads(f.read_text())
+        except ValueError:
+            pass
+print(json.dumps(rec, indent=2, default=str))
+PY
+fi
+
 # The text artefacts are a few KB and are the only way to explain a run that
 # shipped nothing, so they come out even when runs/ is not mounted.
 mkdir -p "$OUT_DIR/logs"

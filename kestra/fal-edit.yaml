@@ -1,0 +1,70 @@
+# Drop-in replacement for the `fal-edit` task in
+# company.team/gen-ai-product-laydown.
+#
+# Same contract as the task it replaces - same id, same inputFiles, same six
+# outputFiles - so `upload-to-spaces` and `notify-endpoint` need no change.
+# What changes is what happens in the middle: instead of one fal workflow call
+# returning four images, the harness picks its own lay reference, writes its
+# own prompt, generates up to LAYDOWN_MAX_IMAGES candidates, grades them, and
+# ships the best four.
+#
+# Consequences worth knowing before this goes near production:
+#
+#   * hero_fit.jpg is accepted and IGNORED. The harness runs its own step 0
+#     against library_reference/ and installs the winner itself. Two reference
+#     systems now exist and only one of them is consulted - Axis still resolves
+#     and parks on a Hero miss, but the Hero no longer reaches the generator.
+#   * a run costs roughly LAYDOWN_MAX_IMAGES/4 times the fal spend of the task
+#     it replaces, and takes minutes rather than one call.
+#   * the harness can legitimately ship fewer than four. It exits 3 and the
+#     missing generated_N.png fails this task, which is the intended loud
+#     failure - `upload-to-spaces` loops over 1..4 unconditionally.
+#   * step 0 stops the run when nothing in the library scores above the
+#     reference threshold. That is a hard stop, not a warning.
+#
+# The image is local, like lightweight-tools:debian - build it on the Kestra
+# worker first:
+#
+#     git clone https://github.com/gasper94/gen-ai-pld.git
+#     cd gen-ai-pld && docker build -t pld-harness .
+
+- id: fal-edit
+  type: io.kestra.plugin.docker.Run
+  containerImage: pld-harness
+  # No networkMode on purpose. This task needs BOTH the public internet (fal)
+  # and the LAN model servers, which is what the default bridge gives. The
+  # kafka_kafka-shared network the MinIO tasks use is not needed here.
+  timeout: PT45M
+  inputFiles:
+    source_fit.jpg: "{{ outputs.compress.outputFiles['source_fit.jpg'] }}"
+    hero_fit.jpg: "{{ outputs.compress.outputFiles['hero_fit.jpg'] }}"
+  outputFiles:
+    - result.json
+    - used_prompt.txt
+    - generated_1.png
+    - generated_2.png
+    - generated_3.png
+    - generated_4.png
+  env:
+    FAL_KEY: "00865205-3770-4f0e-b821-635dba261d12:894fa331c32ff2d384b1bf2c49ec2cf8"
+    # Both models read this. The servers ignore auth, but the tools exit when
+    # it is unset entirely, so the harness's own placeholder stands in.
+    QWEN_API_KEY: "pick-a-long-secret-string"
+    # The text model that drives the agent loop. No /v1 - harness.py appends it.
+    QWEN_BASE_URL: "http://10.11.245.41:8091"
+    # The vision model for step 0 and for grading. /v1 IS required here.
+    REFMATCH_BASE_URL: "http://10.11.245.41:8091/v1"
+    # Ten candidates graded down to four. Four would remove the grading step,
+    # which is the only reason to be running the harness at all.
+    LAYDOWN_MAX_IMAGES: "10"
+    # Renames the picks to the positional names declared above. Without it the
+    # run yields pick1_best_cand_07.png, which outputFiles cannot predict.
+    OUTPUT_PATTERN: "generated_{n}.png"
+  entryPoint: ["/bin/bash", "-c"]
+  commands:
+    - |
+      set -e
+      # Kestra stages inputFiles into the working directory and collects
+      # outputFiles from it, so the harness delivers there rather than to /out.
+      export OUT_DIR="$PWD"
+      exec /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg"
