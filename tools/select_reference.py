@@ -109,7 +109,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--query", type=Path, default=C.INPUTS / "off_set_image.jpg",
-                    help="the off-set photo the reference has to match")
+                    help="the off-set photo the reference has to match. The "
+                         "harness passes <run>/archive/offset_upload.jpg, the "
+                         "pre-cleaned image, so the query and the library are "
+                         "both garments on a white plate.")
+    ap.add_argument("--query-cleaned", action="store_true",
+                    help="declare that --query has been pre-cleaned. Recorded "
+                         "in reference_selection.json; without it the run is "
+                         "marked as matched against a raw input and says so.")
     ap.add_argument("--library", type=Path, default=C.ROOT / "library_reference")
     ap.add_argument("--inputs", type=Path, default=C.INPUTS,
                     help="folder the chosen reference is installed into")
@@ -162,7 +169,16 @@ def main() -> int:
 
     # Flushed, because the child writes straight to the same terminal and an
     # unflushed header lands after all of the matcher's output.
-    print(f"reference selection: {query.name} vs {library.name}/", flush=True)
+    print(f"reference selection: {query.name} vs {library.name}/"
+          f"{'  (pre-cleaned query)' if a.query_cleaned else ''}", flush=True)
+    if not a.query_cleaned:
+        # Every library image is a garment on a white plate. Scoring a raw phone
+        # photo against them charges the query for its room and its hang tag,
+        # and the score that comes out is the number the whole run is anchored
+        # to. Degraded, not dead - but it has to be visible here and in the
+        # receipt, or a raw-match run is indistinguishable from a clean one.
+        print("WARNING: matched against raw input - not pre-cleaned. The tag "
+              "and the room are being scored as part of the garment.")
     rc = subprocess.run(cmd).returncode
     results = run / "match_results.json"
 
@@ -213,8 +229,13 @@ def main() -> int:
 
     record = {
         "selected_at": datetime.now().isoformat(timespec="seconds"),
+        # Which image was actually scored, by path and by content. A run matched
+        # against the cleaned upload and one matched against the raw phone photo
+        # produce the same-shaped record, and this is what tells them apart
+        # afterwards.
         "query": str(query),
         "query_md5": md5(query),
+        "query_cleaned": bool(a.query_cleaned),
         "query_attrs": res.get("query_attrs"),
         "library_root": res.get("library_root"),
         "library_used": res.get("library_used"),
@@ -243,6 +264,9 @@ def main() -> int:
     prov.write_text(json.dumps(record, indent=2, default=str))
 
     print("\nREFERENCE SELECTED")
+    print(f"  matched vs   {query.name}"
+          + ("  (pre-cleaned)" if a.query_cleaned else
+             "  (RAW INPUT - tag and background included in the score)"))
     print(f"  source       {src.parent.name}/{src.name}")
     print(f"  score        {res.get('match_score')}/100"
           + (f"   model confidence {res['model_confidence']}"
@@ -262,7 +286,8 @@ def main() -> int:
         print(f"  stashed      {m}")
     print(f"  provenance   {prov}")
 
-    C.log(run, f"reference {src.name[:28]} ({res.get('match_score')}/100)")
+    C.log(run, f"reference {src.name[:28]} ({res.get('match_score')}/100)"
+               + ("" if a.query_cleaned else " vs RAW query"))
     return 0
 
 

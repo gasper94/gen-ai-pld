@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
@@ -45,6 +46,11 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+# tools/ is not a package - the pipeline scripts are run from inside it - so the
+# trace module is reached the same way they reach common.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+from runlog import trace as TR, stream_subprocess  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -186,20 +192,74 @@ class MalformedToolCall(ModelError):
     """The model emitted tool-call JSON the server could not parse."""
 
 
+_MSG_SEEN: dict[str, list[str]] = {}
+
+
+def _fp(msg) -> str:
+    return hashlib.sha1(json.dumps(msg, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _trace_request_messages(payload: dict) -> None:
+    """Log the messages this request added or rewrote, not the whole history.
+
+    Dumping every message on every call is quadratic - by turn 30 the trace is
+    thirty copies of the same conversation and unreadable. Messages are
+    fingerprinted per conversation instead, so each one is written once, when it
+    first appears, and again if it changes: compaction rewrites tool results in
+    place, and that rewrite is a real event worth seeing at the position it
+    happened. Vision calls are their own conversation - keyed off the first
+    message - so they never collide with the agent's history.
+    """
+    msgs = payload.get("messages") or []
+    if not msgs:
+        return
+    conv = _fp(msgs[0])[:12]
+    seen = _MSG_SEEN.setdefault(conv, [])
+    parts = []
+    for i, m in enumerate(msgs):
+        f = _fp(m)
+        if i < len(seen):
+            if seen[i] == f:
+                continue
+            seen[i] = f
+            parts.append((i, "rewritten", m))
+        else:
+            seen.append(f)
+            parts.append((i, "new", m))
+    if not parts:
+        TR.debug("http", "messages unchanged since the previous request",
+                 conv=conv, count=len(msgs))
+        return
+    body = "\n".join(f"[{i}] {kind}: {json.dumps(m, indent=2, default=str)}"
+                     for i, kind, m in parts)
+    TR.debug("http", "request messages", body=body, conv=conv,
+             total=len(msgs), logged=len(parts))
+
+
 def post(payload: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
+    body_bytes = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{BASE_URL}/v1/chat/completions",
-        data=json.dumps(payload).encode(),
+        data=body_bytes,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {API_KEY}",
         },
     )
+    TR.debug("http", "POST /v1/chat/completions",
+             bytes=len(body_bytes), messages=len(payload.get("messages", [])),
+             max_tokens=payload.get("max_tokens"),
+             temperature=payload.get("temperature"),
+             tools=len(payload.get("tools") or []))
+    _trace_request_messages(payload)
+    t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
+            raw = r.read()
+        data = json.loads(raw)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:500]
+        TR.error("http", f"HTTP {e.code} after {time.time() - t0:.1f}s", body=body)
         if e.code == 401:
             raise ModelError(
                 "401 from the model server. Set QWEN_API_KEY to the key the "
@@ -215,10 +275,22 @@ def post(payload: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
         raise ModelError(f"HTTP {e.code}: {body}") from e
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         reason = getattr(e, "reason", e)
+        TR.error("http", f"unreachable after {time.time() - t0:.1f}s",
+                 error=f"{type(e).__name__}: {reason}")
         raise ConnectionLost(
             f"Cannot reach {BASE_URL} ({reason}). Is the model server up, and are "
             f"you on the same network?"
         ) from e
+
+    usage = data.get("usage", {}) or {}
+    choice = (data.get("choices") or [{}])[0]
+    TR.debug("http", f"200 in {time.time() - t0:.1f}s",
+             bytes=len(raw), finish=choice.get("finish_reason"),
+             prompt_tokens=usage.get("prompt_tokens"),
+             completion_tokens=usage.get("completion_tokens"))
+    TR.debug("http", "response payload",
+             body=json.dumps(data, indent=2, default=str))
+    return data
 
 
 def server_up(timeout: int = 5) -> bool:
@@ -238,6 +310,7 @@ def wait_for_server() -> bool:
     deadline = time.time() + RECONNECT_BUDGET
     budget = (f"{RECONNECT_BUDGET // 60} min" if RECONNECT_BUDGET >= 60
               else f"{RECONNECT_BUDGET}s")
+    TR.warn("server", "waiting for the server to come back", budget_s=RECONNECT_BUDGET)
     print()
     print(c(YEL, f"  server unreachable - waiting up to {budget} for it to come back"))
     print(c(DIM, "  (wake the machine / restart the server; Ctrl-C to give up)"))
@@ -289,6 +362,8 @@ def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERAT
                     "instead of write_file, or raise MAX_TOKENS."
                 ) from e
             payload["max_tokens"] = min(int(payload["max_tokens"] * 2), 8000)
+            TR.warn("model", "malformed tool-call JSON; retrying",
+                    body=str(e), attempt=attempt, max_tokens=payload["max_tokens"])
             print(c(YEL, f"  ! malformed tool-call JSON (likely a truncated "
                          f"argument); retrying at max_tokens="
                          f"{payload['max_tokens']}"))
@@ -298,12 +373,15 @@ def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERAT
             # DHCP lease. Losing a 20-turn run to a 30-second blip is worse than
             # waiting, so keep trying for RECONNECT_BUDGET seconds first.
             last_err = e
+            TR.warn("model", "connection lost; waiting for the server", body=str(e))
             if wait_for_server():
+                TR.info("model", "server returned; retrying the same turn")
                 continue
             raise
         except ModelError as e:
             last_err = e
             attempt += 1
+            TR.warn("model", f"model error (attempt {attempt}/{retries})", body=str(e))
             if attempt > retries:
                 raise
             time.sleep(2 * attempt)
@@ -319,6 +397,8 @@ def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERAT
         if starved and attempt < retries:
             attempt += 1        # must advance, or a persistently starved turn spins
             payload["max_tokens"] = min(int(payload["max_tokens"] * 2), 8000)
+            TR.warn("model", "turn starved by the token budget; retrying",
+                    attempt=attempt, max_tokens=payload["max_tokens"])
             print(c(DIM, f"    (turn starved by token budget; retrying at "
                         f"max_tokens={payload['max_tokens']})"))
             continue
@@ -507,20 +587,35 @@ class Tools:
         p = self.run_dir / "tool_output" / f"{self._spool:03d}_{name}.txt"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text)
+        TR.debug("tool", "spooled oversized output", path=str(p), chars=len(text))
         return p
 
     # -- individual tools -------------------------------------------------
     def bash(self, command: str) -> str:
         for pat, why in BASH_DENY:
             if re.search(pat, command):
+                TR.warn("bash", "REFUSED by guardrail", body=command, rule=why)
                 return f"REFUSED: command blocked by harness guardrail ({why})."
+        TR.info("bash", "run", body=command, cwd=str(self.ws))
+        t0 = time.time()
         try:
             r = subprocess.run(
                 command, shell=True, cwd=self.ws, env=self.env,
                 capture_output=True, text=True, timeout=BASH_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
+            TR.error("bash", f"TIMEOUT after {BASH_TIMEOUT}s; killed", body=command)
             return f"TIMEOUT after {BASH_TIMEOUT}s. Command killed."
+        dt = time.time() - t0
+        # stdout and stderr are logged apart even though the model gets them
+        # concatenated: when a pipeline script fails, which stream carried the
+        # traceback is the first thing you want to know.
+        TR.info("bash", f"exit={r.returncode}", secs=round(dt, 2),
+                out_chars=len(r.stdout or ""), err_chars=len(r.stderr or ""))
+        if r.stdout:
+            TR.debug("bash", "stdout", body=r.stdout)
+        if r.stderr:
+            TR.debug("bash", "stderr", body=r.stderr)
         out = (r.stdout or "") + (r.stderr or "")
         if not out.strip():
             out = "(no output)"
@@ -630,6 +725,8 @@ class Tools:
 
         buf = io.BytesIO()
         im.convert("RGB").save(buf, "JPEG", quality=92)
+        TR.debug("vision", "prepared image", note=note, jpeg_bytes=buf.tell(),
+                 path=str(p), box=box)
         return base64.b64encode(buf.getvalue()).decode(), note
 
     @staticmethod
@@ -710,15 +807,24 @@ class Tools:
     def dispatch(self, name: str, args: dict) -> str:
         fn = getattr(self, name, None)
         if fn is None or name not in {s["function"]["name"] for s in TOOL_SPECS}:
+            TR.error("tool", f"no such tool '{name}'", args=json.dumps(args, default=str))
             return f"ERROR: no such tool '{name}'."
+        TR.info("tool", f"call {name}", body=json.dumps(args, indent=2, default=str))
+        t0 = time.time()
         try:
-            return fn(**args)
+            out = fn(**args)
         except TypeError as e:
-            return f"ERROR: bad arguments for {name}: {e}"
+            out = f"ERROR: bad arguments for {name}: {e}"
         except PermissionError as e:
-            return f"REFUSED: {e}"
+            out = f"REFUSED: {e}"
         except Exception as e:
-            return f"ERROR in {name}: {type(e).__name__}: {e}"
+            TR.exception("tool", f"{name} raised {type(e).__name__}")
+            out = f"ERROR in {name}: {type(e).__name__}: {e}"
+        # The result verbatim, before the model's 4000-char view of it. bash
+        # already logged its own streams; this is the text the model will read.
+        TR.info("tool", f"result {name}", body=out,
+                secs=round(time.time() - t0, 2), chars=len(out))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -731,8 +837,19 @@ class Approver:
         self.always = set()
 
     def ok(self, name: str, args: dict) -> tuple[bool, str]:
-        if self.yolo or name in READONLY_TOOLS or name in self.always:
-            return True, ""
+        allowed, why = self._decide(name, args)
+        TR.event("INFO" if allowed else "WARN", "approval",
+                 f"{name} {'allowed' if allowed else 'DENIED'}",
+                 reason=why or None)
+        return allowed, why
+
+    def _decide(self, name: str, args: dict) -> tuple[bool, str]:
+        if self.yolo:
+            return True, "--yolo"
+        if name in READONLY_TOOLS:
+            return True, "read-only tool"
+        if name in self.always:
+            return True, "user said always"
         if not sys.stdin.isatty():
             return False, ("Denied: harness is not interactive and --yolo was not "
                            "passed, so mutating tools cannot be approved.")
@@ -742,12 +859,14 @@ class Approver:
             ans = input(c(DIM, "    [y]es / [n]o / [a]lways this tool / [q]uit > ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False, "Denied by user."
+        TR.debug("approval", "prompted at the terminal", answer=ans or "(empty=yes)")
         if ans in ("a", "always"):
             self.always.add(name)
             return True, ""
         if ans in ("y", "yes", ""):
             return True, ""
         if ans in ("q", "quit"):
+            TR.warn("approval", "user quit at the approval prompt")
             raise KeyboardInterrupt
         return False, "Denied by user. Try a different approach or ask for guidance."
 
@@ -941,6 +1060,14 @@ class Session:
         self.pinned = 2  # never compact the system prompt or the goal
         self.log_path = run_dir / "transcript.jsonl"
 
+        # The system prompt is assembled here from the skill and a fingerprint
+        # of the workspace, so it differs run to run - and half of "why did it
+        # do that" is answered by what it was told at the start.
+        TR.info("session", "system prompt", body=system, chars=len(system))
+        TR.info("session", "task", body=task)
+        TR.info("session", "skill loaded" if skill_text else "no skill",
+                chars=len(skill_text or ""))
+
     def log(self, kind: str, payload):
         with self.log_path.open("a") as f:
             f.write(json.dumps({"t": time.time(), "kind": kind, "data": payload},
@@ -967,6 +1094,10 @@ class Session:
                 m["_elided"] = True
         self.compactions += 1
         self.log("compact", {"freed_est": int(freed), "prompt_tokens": self.prompt_tokens})
+        TR.warn("context", "compacted history",
+                freed_est=int(freed), prompt_tokens=self.prompt_tokens,
+                compact_at=self.compact_at, compactions=self.compactions,
+                elided_msgs=sum(1 for m in self.messages if m.get("_elided")))
         print(c(DIM, f"  · compacted context (~{int(freed)} tokens reclaimed)"))
 
     def history(self):
@@ -982,11 +1113,15 @@ class Session:
             if self.prompt_tokens > self.compact_at:
                 self.compact()
 
+            TR.rule(f"turn {i}/{self.max_iters}")
+            TR.info("turn", "calling the model", messages=len(self.messages),
+                    prompt_tokens=self.prompt_tokens, n_ctx=self.n_ctx)
             print(c(BOLD, f"\n[{i}/{self.max_iters}]") + c(DIM, "  thinking..."), end="", flush=True)
             t0 = time.time()
             try:
                 data = call_model(self.history(), TOOL_SPECS)
             except ModelError as e:
+                TR.error("turn", "model call failed; ending the run", body=str(e))
                 print()
                 print(c(RED, f"  model error: {e}"))
                 return {"status": "error", "summary": str(e)}
@@ -1006,6 +1141,18 @@ class Session:
             self.log("assistant", {"message": msg, "usage": usage})
 
             think = msg.get("reasoning_content") or msg.get("reasoning")
+            TR.info("turn", f"reply in {dt:.1f}s",
+                    finish=choice.get("finish_reason"),
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    ctx_pct=f"{pct:.0f}%")
+            # Reasoning is dropped from the conversation, so unless it is written
+            # here it is gone - and it is where the model's actual decision was
+            # made. --verbose shows 600 characters of it; the trace keeps it all.
+            if think:
+                TR.debug("reasoning", f"turn {i}", body=think)
+            if msg.get("content"):
+                TR.info("assistant", f"turn {i} content", body=msg["content"])
             if self.verbose and think:
                 print(c(DIM, textwrap.indent(
                     textwrap.shorten(think, 600), "    · ")))
@@ -1023,7 +1170,12 @@ class Session:
                 **({"tool_calls": calls} if calls else {}),
             })
 
+            if calls:
+                TR.info("turn", f"{len(calls)} tool call(s)",
+                        names=",".join(c["function"]["name"] for c in calls))
+
             if not calls:
+                TR.warn("turn", "no tool call" + ("" if text else " and no text"))
                 # No tool, no text: a starved turn. Nudge rather than spin.
                 if not text:
                     self.messages.append({
@@ -1050,6 +1202,8 @@ class Session:
                 except Exception as e:
                     out = (f"ERROR: could not parse your tool arguments as JSON "
                            f"({e}). Send valid JSON.")
+                    TR.error("tool", f"unparseable arguments for {name}",
+                             body=str(raw), error=str(e))
                     self._tool_result(call, out)
                     print(c(RED, f"  ! bad tool arguments for {name}"))
                     continue
@@ -1060,6 +1214,8 @@ class Session:
                     result = {"status": args.get("status", "done"),
                               "summary": args.get("summary", "")}
                     self.log("finish", result)
+                    TR.info("session", f"finish({result['status']}) on turn {i}",
+                            body=result["summary"])
                     return result
 
                 allowed, why = self.approver.ok(name, args)
@@ -1074,9 +1230,14 @@ class Session:
                            f"full output at {sp}] ...\n\n{tail}")
 
                 self.log("tool", {"name": name, "args": args, "result": full[:20000]})
+                if len(out) != len(full):
+                    TR.debug("tool", f"{name} result truncated for the model",
+                             full_chars=len(full), sent_chars=len(out))
                 self._show_result(out)
                 self._tool_result(call, out)
 
+        TR.warn("session", "hit the iteration cap without finish()",
+                max_iters=self.max_iters)
         return result
 
     def _tool_result(self, call, content: str):
@@ -1175,25 +1336,72 @@ def preflight() -> tuple[str, int]:
     hence the fallback. Reading it beats a constant: this project has already
     run a 262144-token server while every budget in the file said 32768.
     """
+    TR.info("preflight", "GET /v1/models", url=f"{BASE_URL}/v1/models")
     try:
         req = urllib.request.Request(f"{BASE_URL}/v1/models",
                                      headers={"Authorization": f"Bearer {API_KEY}"})
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
+        TR.debug("preflight", "models response",
+                 body=json.dumps(data, indent=2, default=str))
         m = data["data"][0]
         n_ctx = int(m.get("max_model_len") or N_CTX_FALLBACK)
+        TR.info("preflight", "server ready", model=m["id"], n_ctx=n_ctx,
+                from_server=bool(m.get("max_model_len")))
         return m["id"], n_ctx
     except SystemExit:
         raise
     except Exception as e:
+        TR.error("preflight", "cannot reach the model server",
+                 error=f"{type(e).__name__}: {e}")
         raise SystemExit(
             f"Cannot reach the model server at {BASE_URL}: {e}\n"
             f"Start it, or set QWEN_BASE_URL (with or without a /v1 suffix)."
         )
 
 
+def pre_clean(workspace: Path, run_dir: Path, python: str) -> Path | None:
+    """Step 0a: erase the tag and drop the background BEFORE the reference is
+    picked.
+
+    The matcher scores the off-set photo against library flats that are all
+    clean studio plates. Handed the raw phone photo it is scoring a garment plus
+    a room plus a hang tag against a garment on white, and every point that
+    costs comes off the one comparison the whole run is anchored to.
+
+    Cleaning used to live inside prepare.py, which the agent runs on its first
+    turn - after step 0 had already matched. Same work, wrong order. It runs
+    here now and prepare.py verifies the result instead of redoing it, so there
+    is one cleaning path and the total spend is unchanged.
+
+    Returns the cleaned image, or None if cleaning did not produce one. None is
+    survivable: the caller falls back to the raw input and says so.
+    """
+    script = workspace / "tools" / "clean.py"
+    out = run_dir / "archive" / "offset_upload.jpg"
+    if not script.exists():
+        TR.warn("step0", f"no {script}; matching against the raw input")
+        return None
+    print(c(BOLD, "\nstep 0a · pre-clean") +
+          c(DIM, "  (so the reference is matched against the clean image)"),
+          flush=True)
+    TR.rule("step 0a - pre-clean")
+    with TR.console_component("step0"):
+        rc = stream_subprocess([python, str(script), "--run", str(run_dir)],
+                               cwd=script.parent, comp="step0")
+    if rc == 0 and out.exists():
+        TR.info("step0", "pre-clean ok", out=str(out))
+        return out
+    TR.warn("step0", "pre-clean failed; matching against the raw input",
+            exit_code=rc, out_exists=out.exists())
+    print(c(YEL, f"  pre-clean failed (exit {rc}); the reference will be "
+                 f"matched against the raw input."))
+    return None
+
+
 def select_reference(workspace: Path, run_dir: Path, python: str,
-                     category: str | None, threshold: float) -> int:
+                     category: str | None, threshold: float,
+                     query: Path | None = None) -> int:
     """Step 0: install the lay reference, before the agent gets a turn.
 
     This is deliberately not the agent's job. Choosing the reference is a
@@ -1207,17 +1415,28 @@ def select_reference(workspace: Path, run_dir: Path, python: str,
     """
     script = workspace / "tools" / "select_reference.py"
     if not script.exists():
+        TR.warn("step0", f"no {script}; skipping reference selection")
         print(c(YEL, f"  no {script.name}; skipping reference selection"))
         return 0
     cmd = [python, str(script), "--run", str(run_dir),
            "--threshold", str(threshold)]
+    if query:
+        cmd += ["--query", str(query), "--query-cleaned"]
     if category:
         cmd += ["--category", category]
     # Flushed: the child writes straight to this terminal, so an unflushed
     # header appears after everything it was supposed to introduce.
     print(c(BOLD, "\nstep 0 · reference selection") +
           c(DIM, "  (deterministic, before the agent starts)"), flush=True)
-    return subprocess.run(cmd, cwd=str(script.parent)).returncode
+    TR.rule("step 0 - reference selection")
+    # Read through us rather than letting the child inherit fd 1, or its output
+    # is the one part of a run the trace cannot see.
+    with TR.console_component("step0"):
+        rc = stream_subprocess(cmd, cwd=script.parent, comp="step0")
+    prov = run_dir / "reference_selection.json"
+    if prov.exists():
+        TR.info("step0", "reference_selection.json", body=prov.read_text())
+    return rc
 
 
 def main():
@@ -1245,6 +1464,11 @@ def main():
     ap.add_argument("--no-reference-select", action="store_true",
                     help="Skip step 0 and run against whatever reference is "
                          "already sitting in inputs/.")
+    ap.add_argument("--no-pre-clean", action="store_true",
+                    help="Do not pre-clean the off-set photo before matching "
+                         "the reference. The match is then made against the raw "
+                         "input, tag and room included, and prepare.py cleans "
+                         "on the agent's first turn as it used to.")
     ap.add_argument("--reference-category",
                     help="Force the library subfolder step 0 searches "
                          "(e.g. bras, leggings) instead of letting the "
@@ -1268,7 +1492,24 @@ def main():
                     help="Start the agent even when step 0 found no matching "
                          "reference. Off by default: the run would be measured "
                          "against a reference for a different garment.")
+    ap.add_argument("--trace-level", default="DEBUG",
+                    choices=["DEBUG", "INFO", "WARN", "ERROR"],
+                    help="Detail written to runs/<session>/run.log. DEBUG (the "
+                         "default) keeps the model's reasoning and every HTTP "
+                         "payload; INFO keeps the console, tools and results.")
+    ap.add_argument("--no-trace", action="store_true",
+                    help="Do not write runs/<session>/run.log.")
     args = ap.parse_args()
+
+    # Before anything else that prints or calls out: the trace has nowhere to
+    # live until the run folder is stamped, so early events are buffered and
+    # flushed by attach() below.
+    if args.no_trace:
+        TR.enabled = False
+    else:
+        TR.tee()
+    TR.info("harness", "invoked", argv=" ".join(sys.argv[1:]), pid=os.getpid(),
+            cwd=os.getcwd(), python=sys.executable)
 
     workspace = args.workspace.resolve()
     if not workspace.is_dir():
@@ -1283,8 +1524,6 @@ def main():
     if skill_path and not args.task and skill_desc:
         task = f"{skill_desc}\n\n{task}"
 
-    model, n_ctx = preflight()
-
     # One run means one folder, and run.sh stamps it. Deriving a second stamp
     # here put the transcript and the pipeline's own steps.log in folders that
     # only agreed because they were a second apart; set it either way so that
@@ -1294,15 +1533,41 @@ def main():
     run_dir = workspace / "runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Attached before preflight, not after: a run that dies because the server
+    # is unreachable is exactly the one someone wants a trace of, and until
+    # there is a file everything is only buffered in memory.
+    if TR.enabled:
+        TR.attach(run_dir / "run.log", level=args.trace_level, header={
+            "session": stamp,
+            "argv": " ".join(sys.argv[1:]),
+            "workspace": workspace,
+            "skill": skill_path or "(none)",
+            "server": BASE_URL,
+            "python": sys.executable,
+            "pid": os.getpid(),
+        })
+        TR.info("harness", "options", **{
+            k: v for k, v in vars(args).items() if k != "task"})
+
+    model, n_ctx = preflight()
+
     tools = Tools(workspace, run_dir, args.allow_outside)
+    TR.info("harness", "child interpreter for pipeline scripts", python=tools.python)
 
     # Step 0, before the Session is built: the inventory in the system prompt is
     # fingerprinted at construction time, so the reference has to be on disk by
     # then or the agent is told about the previous garment's one.
     if not args.no_reference_select:
+        # Clean first, match second. The order is the point: the matcher has to
+        # see the same image the rest of the pipeline works from.
+        clean = (None if args.no_pre_clean else
+                 pre_clean(workspace, run_dir, tools.python))
         rc = select_reference(workspace, run_dir, tools.python,
-                              args.reference_category, args.reference_threshold)
+                              args.reference_category, args.reference_threshold,
+                              query=clean)
         if rc != 0 and not args.allow_no_reference:
+            TR.error("step0", "no reference installed; stopping before the agent",
+                     exit_code=rc)
             print(c(RED, "\nstopping before the agent starts."))
             print(c(DIM, "  No reference was installed, so every measurement "
                          "downstream would be against the wrong garment."))
@@ -1338,8 +1603,12 @@ def main():
     try:
         result = sess.run()
     except KeyboardInterrupt:
+        TR.warn("harness", "interrupted by the user (Ctrl-C)")
         print(c(YEL, "\n\ninterrupted."))
         result = {"status": "interrupted", "summary": "User interrupted the run."}
+    except BaseException as e:
+        TR.exception("harness", f"run aborted: {type(e).__name__}: {e}")
+        raise
 
     dt = time.time() - t0
     colour = {"done": GRN, "blocked": YEL}.get(result["status"], RED)
@@ -1350,10 +1619,29 @@ def main():
     if result.get("summary"):
         print("\n" + textwrap.indent(textwrap.fill(result["summary"], 76), "  "))
     print(c(DIM, f"\n  transcript: {sess.log_path}"))
+    if TR.path:
+        print(c(DIM, f"  trace:      {TR.path}"))
 
     sess.log("end", {"result": result, "seconds": dt})
+    TR.info("harness", f"run finished: {result['status']}",
+            body=result.get("summary"), seconds=round(dt, 1),
+            completion_tokens=sess.total_completion,
+            compactions=sess.compactions)
     return 0 if result["status"] == "done" else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except SystemExit as e:
+        # argparse and the preflight both leave this way; the message is the
+        # whole story of a run that never started, so it belongs in the trace.
+        TR.error("harness", f"exit: {e}")
+        TR.close("exited before completing")
+        raise
+    except BaseException as e:
+        TR.exception("harness", f"unhandled {type(e).__name__}: {e}")
+        TR.close("crashed")
+        raise
+    TR.close(f"exit code {rc}")
+    sys.exit(rc)

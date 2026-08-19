@@ -5,6 +5,8 @@ Everything here is deterministic and cheap. The billed work is in generate.py.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -25,6 +27,20 @@ RUNS = ROOT / "runs"
 # rates - fal exposes no billing API, so a reported cost is never a receipt.
 ENDPOINT = "fal-ai/nano-banana-pro/edit"
 PRICE_4K = 0.30
+
+# Canonical region profile -> the garment_type spellings that mean it. This is
+# the same token vocabulary match_reference.py uses to pick the library folder,
+# so the crops a tool measures with always follow the category step 0 already
+# decided rather than a flag somebody remembered to pass. Shorts are graded on
+# the leggings bands: same waistband, same hip, hem just higher up.
+PROFILE_TERMS = {
+    "bras": {"bra", "bras", "sports_bra", "sports_bras", "bralette",
+             "bralettes", "t_shirt_bra", "crop_top", "crop_tops"},
+    "leggings": {"legging", "leggings", "legging_bottoms", "tight", "tights",
+                 "short", "shorts", "biker_short", "biker_shorts",
+                 "cycling_shorts"},
+}
+DEFAULT_PROFILE = "leggings"
 
 
 def session_run_dir() -> Path:
@@ -83,6 +99,68 @@ def log(run_dir: Path, what: str, cents: float = 0.0) -> str:
         f.write(line + "\n")
     print(line, flush=True)
     return line
+
+
+def md5(p: Path) -> str:
+    """Content fingerprint of a file. Used to tell "the same image" from "an
+    image with the same name", which is the whole basis of reusing a verdict."""
+    return hashlib.md5(Path(p).read_bytes()).hexdigest()
+
+
+def profile_for(garment_type: str) -> str | None:
+    """Canonical profile for a garment_type string, or None if it means nothing
+    here. Matching is on the normalised token, so 'sports_bra', 'Sports Bra'
+    and 'bras' all land on the same profile."""
+    w = re.sub(r"[^a-z]+", "_", str(garment_type).lower()).strip("_")
+    for prof, terms in PROFILE_TERMS.items():
+        if w in terms:
+            return prof
+    return None
+
+
+def garment_profile(run_dir: Path,
+                    override: str | None = None) -> tuple[str, str, bool]:
+    """Which region profile this run's garment needs: (profile, why, resolved).
+
+    Step 0 already classified the garment - select_reference.py writes the
+    garment_type it used to pick the library folder into
+    <run>/reference_selection.json - so no tool needs to be told again, and a
+    flag left off cannot quietly point a region-based check at the wrong part of
+    the garment. That failure is silent and expensive: a bra measured with the
+    leggings bands puts 'waistband' on empty plate above the straps and 'hem'
+    below the garment entirely, and every candidate then comes back flagged in
+    near-identical words because the crops, not the candidates, are wrong.
+
+    `resolved` is False when the garment could not be established, and the
+    profile returned alongside it is only a fallback. `why` says what was found
+    and no more - what a tool then does about it differs by tool, so each one
+    states its own consequence rather than inheriting a sentence from here.
+    Callers print `why` either way: a profile that was guessed has to be visible
+    in the output it produced.
+    """
+    if override:
+        prof = profile_for(override) or override
+        return prof, f"{prof} - forced by --profile", prof in PROFILE_TERMS
+
+    f = Path(run_dir) / "reference_selection.json"
+    if not f.exists():
+        return (DEFAULT_PROFILE,
+                f"WARNING: no {f.name} in {Path(run_dir).name}, so the garment "
+                f"is unknown", False)
+    try:
+        sel = json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        return (DEFAULT_PROFILE,
+                f"WARNING: {f.name} unreadable ({type(e).__name__}), so the "
+                f"garment is unknown", False)
+
+    gt = str((sel.get("query_attrs") or {}).get("garment_type", "")).strip()
+    prof = profile_for(gt)
+    if prof:
+        return prof, f"{prof} - from garment_type '{gt}' in {f.name}", True
+    return (DEFAULT_PROFILE,
+            f"WARNING: garment_type {gt or 'missing'!r} in {f.name} matches no "
+            f"profile ({', '.join(sorted(PROFILE_TERMS))})", False)
 
 
 def garment_mask(path: Path, long_side: int = 1024):

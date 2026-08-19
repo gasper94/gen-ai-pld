@@ -189,13 +189,23 @@ def main() -> int:
                 "still comes from image 1 and none of it from image 2.")
         print("  NOTE: reference is not greyscale - colour may bleed from it")
 
-    # Pre-clean automatically: erase tags and pins, drop the background, plate
-    # white. This is deterministic pipeline work, not a judgement call, and it
-    # removes two whole jobs from the re-lay prompt. Measured on this project's
-    # own source: tag and clip erased, bench and shoes gone, garment colour
-    # drift 0.4, full 3072x4096 preserved.
+    # The pre-clean - tag erased, background dropped, plate white - normally
+    # happened HERE, on the agent's first turn. It now runs at step 0, before
+    # the reference is matched, so the matcher scores the same image the rest of
+    # the pipeline works from. Same work, same spend, earlier.
+    #
+    # So the job here is to verify, not to redo. Cleaning again would be two
+    # billed calls for an image already on disk, and a second cleaning path that
+    # can disagree with the first. clean.py is run below only when step 0 did
+    # not leave one - a direct `prepare.py` outside the harness, or a step 0
+    # that failed - which keeps this script usable on its own.
     up_path = run / "archive" / "offset_upload.jpg"
-    if a.clean:
+    if a.clean and up_path.exists():
+        w, h = Image.open(up_path).size
+        print(f"pre-cleaned  archive/offset_upload.jpg {w}x{h}  "
+              f"{up_path.stat().st_size/1e6:.1f} MB  (from step 0, not redone)")
+    elif a.clean:
+        print("no pre-cleaned upload from step 0; cleaning now.")
         import subprocess
         r = subprocess.run([sys.executable, str(Path(__file__).with_name("clean.py")),
                             "--run", str(run), "--off-set", str(a.off_set),
@@ -206,6 +216,13 @@ def main() -> int:
             print("  pre-clean failed; falling back to a plain downscaled copy.")
             a.clean = False
     if not a.clean:
+        if up_path.exists():
+            # --no-clean is explicit, so it is honoured - but step 0 matched the
+            # reference against the cleaned image, and this replaces it with a
+            # raw one. The two are then describing different pictures.
+            print("  WARNING: --no-clean is overwriting the pre-cleaned upload "
+                  "step 0 produced. The reference was chosen by matching that "
+                  "image; this one still has the tag and the background.")
         up = off.convert("RGB")
         up.thumbnail((a.upload_long_side, a.upload_long_side), Image.LANCZOS)
         up.save(up_path, quality=95, subsampling=0,

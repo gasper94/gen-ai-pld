@@ -25,8 +25,11 @@ Stages
   2. Vision grading, --votes independent calls per candidate, median taken.
      Expected edits (background swap, relight, de-wrinkling, reframing) are
      declared up front as NOT defects, or the judge reports them as failures.
-  3. Construction check on native-resolution crops (waistband, hip, hem) against
-     the reference. Any MISMATCH disqualifies regardless of how clean it looks.
+  3. Construction check on native-resolution crops against the reference. Any
+     MISMATCH disqualifies regardless of how clean it looks. Which regions get
+     cropped follows the garment: the profile is read from the garment_type in
+     <run>/reference_selection.json, so grading a bra with the leggings bands is
+     not something a forgotten flag can cause.
 
 Two notes carried over from the pipeline this replaces, because they were paid
 for here and the code above does not encode them:
@@ -391,7 +394,9 @@ REGIONS = {           # name -> (top, bottom) as a fraction of the garment bbox
 }
 
 # Bras are wider than tall and have no waistband or hem, so the leggings bands
-# land on empty plate. profiles/ already splits the two categories.
+# land on empty plate. profiles/ already splits the two categories, and
+# C.garment_profile() picks between them from the run's own garment_type -
+# --profile only overrides that.
 REGIONS_BY_PROFILE = {
     "leggings": REGIONS,
     "bras": {"band": (0.62, 1.00), "cups/centre": (0.25, 0.68),
@@ -423,6 +428,41 @@ def crop_region(src: Path, span: tuple[float, float], tag: str) -> Path:
                     "-resize", "1024x1024>", str(out)],
                    check=True, capture_output=True)
     return out
+
+
+def region_spec(regions: dict) -> str:
+    """The crop bands themselves, as a string, for the cache fingerprint. Edit a
+    band and every verdict taken with the old one stops matching, which is the
+    behaviour you want: those verdicts were about a different piece of fabric."""
+    return "|".join(f"{n}:{a:.3f}-{b:.3f}" for n, (a, b) in regions.items())
+
+
+def fingerprint(cand: Path, ref: Path, profile: str, regions: dict) -> dict:
+    """What a stored verdict has to agree with before it can be reused.
+
+    Content hashes, not filenames or mtimes: cand_02.png regenerated under the
+    same name is a different image and must be re-judged, while the same bytes
+    re-graded on a later pass are not.
+    """
+    return {"cand_md5": C.md5(cand), "ref_md5": C.md5(ref),
+            "profile": profile, "regions": region_spec(regions)}
+
+
+def load_cache(arch: Path) -> dict:
+    """Stage-3 verdicts an earlier pass already paid for, keyed by candidate.
+
+    They live in metrics.json so there is one record rather than a file that
+    can disagree with it. A cache that cannot be read is not an error - it just
+    means everything is judged fresh.
+    """
+    p = arch / "metrics.json"
+    if not p.exists():
+        return {}
+    try:
+        got = json.loads(p.read_text()).get("construction_cache") or {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def check_construction(client: Client, ref: Path, cand: Path, regions: dict) -> list[dict]:
@@ -483,7 +523,8 @@ def build_sheet(ref_small: Path, rows: list[dict], out: Path) -> Path:
     return out
 
 
-def write_metrics_json(arch: Path, rows: list[dict], ref: Path, args) -> Path:
+def write_metrics_json(arch: Path, rows: list[dict], ref: Path, args,
+                       profile: str, profile_resolved: bool, cache: dict) -> Path:
     """Write archive/metrics.json - the run's machine-readable verdict.
 
     Nothing consumes this automatically any more; review.py, which used to
@@ -491,12 +532,23 @@ def write_metrics_json(arch: Path, rows: list[dict], ref: Path, args) -> Path:
     because it is the only per-candidate record with the construction verdicts
     in it, and `## Results` in the log has to be written from measured numbers
     rather than remembered ones.
+
+    It is also where stage-3 verdicts are stored between passes, under
+    `construction_cache`. Written whole every time, including entries for
+    candidates this pass did not judge, so a `--no-construction` or
+    `--candidates`-narrowed run cannot quietly delete a verdict that was paid
+    for earlier.
     """
     out = {
         "schema": "grade",
         "reference": str(ref),
         "min_grade": args.min_grade,
         "judge": args.judge,
+        # Which regions the construction verdicts below were taken on, and
+        # whether that was read from the run or assumed. A verdict read without
+        # this cannot be checked afterwards.
+        "profile": profile,
+        "profile_resolved": profile_resolved,
         "candidates": [{
             "cand": r["name"],
             "file": str(r["path"]),
@@ -513,7 +565,11 @@ def write_metrics_json(arch: Path, rows: list[dict], ref: Path, args) -> Path:
             "wrinkle_energy": r["metrics"]["wrinkle_energy"],
             "bg_lum": r["metrics"]["bg_lum"],
             "construction": r.get("construction", []),
+            # Judged this pass, or reused from a previous one. `## Results` can
+            # then say when the flags it quotes were actually decided.
+            "construction_from": r.get("construction_from", "not checked"),
         } for r in rows],
+        "construction_cache": cache,
     }
     p = arch / "metrics.json"
     p.write_text(json.dumps(out, indent=2, default=str))
@@ -536,9 +592,10 @@ def main() -> int:
     ap.add_argument("--candidates", type=Path, default=None,
                     help="default <run>/archive, auto-selecting every generated "
                          "image at the highest resolution present.")
-    ap.add_argument("--profile", choices=sorted(REGIONS_BY_PROFILE),
-                    default="leggings",
-                    help="which crop regions stage 3 uses. Bras have no "
+    ap.add_argument("--profile", choices=sorted(REGIONS_BY_PROFILE), default=None,
+                    help="which crop regions stage 3 uses. Read automatically "
+                         "from the garment_type in <run>/reference_selection.json "
+                         "- pass this only to override that. Bras have no "
                          "waistband or hem, so the leggings bands land on plate.")
     ap.add_argument("--judge", choices=["metrics", "tournament", "absolute"],
                     default="metrics",
@@ -570,7 +627,16 @@ def main() -> int:
     ap.add_argument("--bg-white", type=float, default=0.99,
                     help="backdrop lightness scoring 100 (default 0.99)")
     ap.add_argument("--no-construction", action="store_true",
-                    help="skip the crop-level construction integrity check")
+                    help="skip the crop-level construction integrity check. "
+                         "Stored verdicts are left alone, not discarded.")
+    ap.add_argument("--rejudge", action="store_true",
+                    help="re-run stage 3 on candidates that already have a "
+                         "stored verdict, replacing it. Without this a verdict "
+                         "is judged once per (candidate, reference, profile) "
+                         "and reused, so grading twice cannot produce two "
+                         "different sets of flags. This is the deliberate way "
+                         "to get a second opinion - and it overwrites, so there "
+                         "is still exactly one record.")
     ap.add_argument("--ship", type=int, default=0, metavar="N",
                     help="copy the top N candidates BY GRADE to <run>/output/, "
                          "regardless of status. The grade has no construction "
@@ -610,11 +676,54 @@ def main() -> int:
         print(f"No candidates in {arch}. Run generate.py first.", file=sys.stderr)
         return 1
 
+    # Stage 3 is the only check that can tell a re-laid garment from a redrawn
+    # one, and it is worthless if its crops land on the wrong part of the
+    # garment. So the profile is read off the run rather than left to a flag.
+    profile, prof_why, prof_ok = C.garment_profile(args.run, args.profile)
+    if profile not in REGIONS_BY_PROFILE:
+        print(f"unknown profile {profile!r}; choose from "
+              f"{', '.join(sorted(REGIONS_BY_PROFILE))}", file=sys.stderr)
+        return 1
+
+    # An assumed profile means stage 3 cropped somewhere it was never told to
+    # look, so its verdicts say nothing about this garment. That used to be a
+    # printed warning, which is to say it was ignored and a batch shipped on
+    # verdicts taken from empty plate. Delivery is now refused outright, before
+    # anything is graded, so the cost of the mistake is one flag rather than a
+    # whole run. --no-construction does NOT unblock it: skipping the check is a
+    # decision to ship unchecked, and it is not one to make by accident while
+    # trying to get past this message.
+    if not prof_ok and args.ship:
+        print(f"\nREFUSING TO SHIP: {prof_why}\n"
+              f"  --ship writes the deliverable, and stage 3 - the only check "
+              f"that can tell a re-laid garment from a redrawn one - crops by "
+              f"garment. On the wrong profile it reads empty plate and returns "
+              f"confident verdicts about nothing.\n"
+              f"  Fix it: --profile {' | --profile '.join(sorted(REGIONS_BY_PROFILE))}\n"
+              f"  Or find out why step 0 did not record a garment_type - "
+              f"{args.run / 'reference_selection.json'} is where it belongs.\n"
+              f"  Grading without --ship still runs, so you can look first.",
+              file=sys.stderr)
+        return 1
+
     client = Client(args.base_url, args.model, args.timeout)
     model = client.resolve_model()
     print(f"model: {model}")
     print(f"reference:  {ref}   (the cleaned upload, not the raw input)")
-    print(f"candidates: {len(cands)}   votes/candidate: {args.votes}\n")
+    print(f"candidates: {len(cands)}   votes/candidate: {args.votes}")
+    # Only reachable unresolved without --ship, which is refused above.
+    prof_line = f"profile:    {prof_why}"
+    if not prof_ok:
+        prof_line += (f"\n            grading anyway on {profile} regions, but "
+                      f"stage 3 is looking at a garment nobody confirmed. "
+                      f"--ship is refused until --profile says which.")
+    print(prof_line + "\n")
+
+    # Verdicts an earlier pass already paid for. Kept across the whole run so
+    # --no-construction rewrites metrics.json without dropping them.
+    cache = load_cache(arch)
+    if args.rejudge and cache:
+        print(f"--rejudge: {len(cache)} stored verdict(s) will be replaced\n")
 
     # --- Stage 1 ---------------------------------------------------------
     print("stage 1: deterministic metrics (no model)")
@@ -708,23 +817,76 @@ def main() -> int:
                   f"(energy {r['metrics']['wrinkle_energy']:.5f}, batch-relative)")
 
     # --- Stage 3 ---------------------------------------------------------
-    regions = REGIONS_BY_PROFILE[args.profile]
+    regions = REGIONS_BY_PROFILE[profile]
+    n_reused = 0
     if not args.no_construction:
-        print(f"\nstage 3: construction integrity on native-res crops "
-              f"({', '.join(regions)})")
+        print(f"\nstage 3: construction integrity on native-res crops, "
+              f"{profile} regions ({', '.join(regions)})")
         t0 = time.time()
+        n_judged = 0
         for r in rows:
-            transient(f"  {r['name']:<10}  checking ...")
-            r["construction"] = check_construction(client, ref, r["path"], regions)
+            fp = fingerprint(r["path"], ref, profile, regions)
+            hit = cache.get(r["name"]) or {}
+            fresh = args.rejudge or any(hit.get(k) != v for k, v in fp.items())
+            if fresh:
+                transient(f"  {r['name']:<10}  judging ...")
+                r["construction"] = check_construction(client, ref, r["path"], regions)
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+                r["construction_from"] = f"judged {stamp[11:]}"
+                n_judged += 1
+                # An ERROR is a call that did not happen, not a verdict about
+                # the garment. Caching one would freeze a dropped connection
+                # into the record and never ask again.
+                if not any(c.get("verdict") == "ERROR" for c in r["construction"]):
+                    cache[r["name"]] = {**fp, "judged_at": stamp, "model": model,
+                                        "verdicts": r["construction"]}
+                else:
+                    cache.pop(r["name"], None)
+            else:
+                r["construction"] = hit["verdicts"]
+                r["construction_from"] = f"cached {hit.get('judged_at', '')[11:]}"
+                n_reused += 1
+
+            note = (f"   ({r['construction_from']})" if not fresh else "")
             bad = [c for c in r["construction"] if c.get("verdict") == "MISMATCH"]
             if bad:
                 settled(f"  {r['name']:<10}  MISMATCH in "
-                        f"{', '.join(c['region'] for c in bad)}")
+                        f"{', '.join(c['region'] for c in bad)}{note}")
                 for c in bad:
                     print(f"                -> {c['region']}: {c.get('detail','')}")
             else:
-                settled(f"  {r['name']:<10}  all regions match")
-        print(f"  done in {time.time() - t0:.1f}s")
+                settled(f"  {r['name']:<10}  all regions match{note}")
+        # The same images judged twice give two different answers - this model
+        # scored one candidate 100 then 60 on a rescale alone - so a second pass
+        # over the same batch reuses the first pass's verdict instead of rolling
+        # again. That is what makes the flags in output/, in the ranking and in
+        # LOG.md the same flags rather than three independent samples.
+        print(f"  done in {time.time() - t0:.1f}s   "
+              f"{n_judged} judged, {n_reused} reused from metrics.json"
+              + ("  (--rejudge: cache overwritten)" if args.rejudge and n_judged
+                 else ""))
+        if n_reused and not args.rejudge:
+            print("  reused verdicts were not re-rolled. --rejudge forces a "
+                  "fresh judgement and replaces the stored one.")
+
+        # Independent generations fail in independent ways. When every one of
+        # them is flagged in the same region, the common cause is far more
+        # likely to be the crop than the candidates - the wrong profile puts
+        # 'waistband' on empty plate, and the judge dutifully reports the whole
+        # band as missing on all of them. Check the region before believing it.
+        flagged = [{c["region"] for c in r["construction"]
+                    if c.get("verdict") == "MISMATCH"} for r in rows]
+        shared = set.intersection(*flagged) if len(rows) > 1 and all(flagged) else set()
+        if shared:
+            print(f"\n  WARNING: all {len(rows)} candidates are flagged in "
+                  f"{', '.join(sorted(shared))}. Independent draws rarely fail "
+                  f"identically, so check the crops before the candidates:")
+            print(f"    profile in use: {prof_why}")
+            print(f"    look at one pair - crop_pair.py --run {args.run} --cand NN "
+                  f"--at {sorted(shared)[0].split('/')[0]}")
+            if not prof_ok:
+                print("    the profile was ASSUMED, not read. That is the first "
+                      "thing to rule out.")
     else:
         for r in rows:
             r["construction"] = []
@@ -785,6 +947,9 @@ def main() -> int:
         "model": model,
         "reference": str(ref),
         "reference_metrics": ref_m,
+        "profile": profile,
+        "profile_source": prof_why,
+        "profile_resolved": prof_ok,
         "votes": args.votes,
         "min_grade": args.min_grade,
         "best": winners[0]["name"] if winners else None,
@@ -793,7 +958,7 @@ def main() -> int:
         "candidates": [{k: v for k, v in r.items()
                         if k not in ("_small", "path")} for r in rows],
     }, indent=2, default=str))
-    mp = write_metrics_json(arch, rows, ref, args)
+    mp = write_metrics_json(arch, rows, ref, args, profile, prof_ok, cache)
 
     print()
     if winners:
@@ -808,7 +973,10 @@ def main() -> int:
     print(f"wrote {arch / 'grade_results.json'}")
     print(f"wrote {mp}   <- per-candidate verdicts, incl. construction")
     print(f"wrote {sheet}")
-    C.log(args.run, f"graded {len(rows)} ({label}), {len(winners)} shippable")
+    C.log(args.run, f"graded {len(rows)} ({label}), {len(winners)} shippable"
+                    + (f", {profile} regions" if not args.no_construction else
+                       ", no construction check")
+                    + (f" ({n_reused} verdict(s) reused)" if n_reused else ""))
 
     if args.ship:
         return ship(args, winners, rows)
@@ -887,7 +1055,8 @@ def ship(args, winners: list[dict], rows: list[dict]) -> int:
         mism = [c for c in r.get("construction", [])
                 if c.get("verdict") == "MISMATCH"]
         if mism:
-            shipped_bad.append((r["name"], [c["region"] for c in mism]))
+            shipped_bad.append((r["name"], [c["region"] for c in mism],
+                                r.get("construction_from", "not checked")))
             print(f"  {'':4}SHIPPED WITH ALTERED CONSTRUCTION: "
                   f"{', '.join(c['region'] for c in mism)}")
             for c in mism:
@@ -929,8 +1098,8 @@ def ship(args, winners: list[dict], rows: list[dict]) -> int:
     if shipped_bad:
         print(f"\n{len(shipped_bad)} of {len(picks)} shipped with construction "
               f"the vision check flagged as altered:")
-        for name, regions in shipped_bad:
-            print(f"  {name:10} {', '.join(regions)}")
+        for name, regions, when in shipped_bad:
+            print(f"  {name:10} {', '.join(regions):<40} {when}")
         print(f"Per-region detail is in {arch.name}/grade_results.json. Say in "
               f"`## Notes` which picks carry this - the grade does not, and "
               f"output/ on its own cannot tell anyone.")

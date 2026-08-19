@@ -201,10 +201,12 @@ print(json.dumps(rec, indent=2, default=str))
 PY
 fi
 
-# The text artefacts are a few KB and are the only way to explain a run that
-# shipped nothing, so they come out even when runs/ is not mounted.
+# The text artefacts are the only way to explain a run that shipped nothing, so
+# they come out even when runs/ is not mounted. All small except run.log, which
+# is the full trace and can reach a few MB on a long run - worth every byte on
+# the run someone is asking questions about, and dwarfed by one delivered PNG.
 mkdir -p "$OUT_DIR/logs"
-for f in steps.log LOG.md transcript.jsonl reference_selection.json \
+for f in steps.log LOG.md run.log transcript.jsonl reference_selection.json \
          match_results.json result_top_matches.jpg; do
     [ -e "$RUN_DIR/$f" ] && cp -p "$RUN_DIR/$f" "$OUT_DIR/logs/"
 done
