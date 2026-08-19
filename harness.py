@@ -89,6 +89,14 @@ RECONNECT_POLL = 10
 MAX_TOOL_CHARS = 4000    # per tool result fed back to the model
 BASH_TIMEOUT = 900
 
+# "The library has nothing close enough to this garment" is an expected answer,
+# not a fault, and it has to be distinguishable from one. It used to leave here
+# as 1, the same code a crash leaves as, which made a scheduler show a run that
+# worked perfectly as a failure and put it in the same list as a broken model
+# server. 20 is far enough from the small codes to collide with nothing: 1 is
+# breakage, 2 is the entrypoint's own usage errors, 3 is a short delivery.
+EXIT_NO_REFERENCE = 20
+
 # Tools that only observe. These never prompt for approval.
 READONLY_TOOLS = {"read_file", "view_image", "compare_images", "finish"}
 
@@ -1448,6 +1456,9 @@ def main():
               ./run.sh --skill laydown-match
               ./run.sh --skill laydown-match --task "Run stage 1 only, no API calls"
               ./run.sh --task "Summarise this folder" --max-iters 5 --yolo
+              ./run.sh --reference-only          # step 0 only: can the library
+                                                 # serve this garment? 0 yes,
+                                                 # 20 upload a hero
         """),
     )
     ap.add_argument("--skill", help="Skill name under skills/<name>/SKILL.md, or a path.")
@@ -1492,6 +1503,14 @@ def main():
                     help="Start the agent even when step 0 found no matching "
                          "reference. Off by default: the run would be measured "
                          "against a reference for a different garment.")
+    ap.add_argument("--reference-only", action="store_true",
+                    help="Run step 0 and stop: pre-clean, match, install the "
+                         "reference, write reference_selection.json, never "
+                         "start the agent. This is the cheap gate a caller runs "
+                         "first to find out whether the library can serve this "
+                         "garment at all - exit 0 if it can, "
+                         f"{EXIT_NO_REFERENCE} if a human has to upload a hero. "
+                         "No fal spend and no text model needed either way.")
     ap.add_argument("--trace-level", default="DEBUG",
                     choices=["DEBUG", "INFO", "WARN", "ERROR"],
                     help="Detail written to runs/<session>/run.log. DEBUG (the "
@@ -1518,8 +1537,15 @@ def main():
     skill_path = resolve_skill(workspace, args.skill, args.skill_file)
     skill_text, skill_desc = load_skill(skill_path) if skill_path else ("", "")
 
+    if args.reference_only and args.no_reference_select:
+        raise SystemExit("--reference-only and --no-reference-select cancel "
+                         "each other out: the first runs nothing but step 0 "
+                         "and the second is what skips step 0.")
+
     task = args.task or (DEFAULT_TASK if skill_path else None)
-    if not task:
+    # A gate run never reaches the agent, so it does not need to be told what
+    # the agent would have done.
+    if not task and not args.reference_only:
         raise SystemExit("Nothing to do: pass --task and/or --skill.")
     if skill_path and not args.task and skill_desc:
         task = f"{skill_desc}\n\n{task}"
@@ -1549,7 +1575,11 @@ def main():
         TR.info("harness", "options", **{
             k: v for k, v in vars(args).items() if k != "task"})
 
-    model, n_ctx = preflight()
+    # Skipped for a gate run, and deliberately: step 0 talks to the vision
+    # server (REFMATCH_BASE_URL), not this one, so a gate that preflighted the
+    # text model would report "no hero" as unreachable-server breakage on a day
+    # the agent was never going to run anyway.
+    model, n_ctx = (None, N_CTX_FALLBACK) if args.reference_only else preflight()
 
     tools = Tools(workspace, run_dir, args.allow_outside)
     TR.info("harness", "child interpreter for pipeline scripts", python=tools.python)
@@ -1565,20 +1595,62 @@ def main():
         rc = select_reference(workspace, run_dir, tools.python,
                               args.reference_category, args.reference_threshold,
                               query=clean)
+        # 2 and 1 are different answers and must not leave here as the same
+        # code. 2 is "the library has nothing close enough, a human has to
+        # upload a hero" - the pipeline worked and gave its verdict. 1 is the
+        # matcher itself breaking. Collapsing them meant a scheduler could only
+        # see "the run stopped", so a correct verdict sat in the failure list
+        # next to an unreachable model server, and the list stopped being read.
         if rc != 0 and not args.allow_no_reference:
-            TR.error("step0", "no reference installed; stopping before the agent",
-                     exit_code=rc)
-            print(c(RED, "\nstopping before the agent starts."))
-            print(c(DIM, "  No reference was installed, so every measurement "
-                         "downstream would be against the wrong garment."))
+            business = rc == 2
+            (TR.warn if business else TR.error)(
+                "step0", "no reference installed; stopping before the agent",
+                exit_code=rc, outcome="no_reference" if business else "error")
+            if business:
+                print(c(YEL, "\nno reference: the library has nothing close "
+                             "enough to this garment."))
+                print(c(DIM, "  This is an answer, not a failure. Someone has "
+                             "to upload a hero for this style; the run stops "
+                             f"here and exits {EXIT_NO_REFERENCE}."))
+                print(c(DIM, "  reference_selection.json records the closest "
+                             "the library came, and result_top_matches.jpg "
+                             "shows it."))
+            else:
+                print(c(RED, "\nstopping before the agent starts."))
+                print(c(DIM, "  Reference selection broke; nothing was "
+                             "installed, so every measurement downstream would "
+                             "be against the wrong garment."))
             print(c(DIM, "  --allow-no-reference runs anyway; "
                          "--no-reference-select uses what is already in inputs/;"))
             print(c(DIM, "  --reference-category / --reference-threshold widen "
                          "the search."))
-            return 1
+            return EXIT_NO_REFERENCE if business else 1
         if rc != 0:
             print(c(YEL, "\n  --allow-no-reference: starting with whatever "
                          "reference inputs/ already holds."))
+
+    # The gate stops here. Everything above is deterministic and cheap; the
+    # agent below is neither, and a caller that only wants to know whether the
+    # library can serve this garment should not have to pay for it to find out.
+    if args.reference_only:
+        prov = run_dir / "reference_selection.json"
+        TR.info("step0", "--reference-only: stopping after step 0",
+                receipt=str(prov), exists=prov.exists())
+        print(c(BOLD, "\n--reference-only") +
+              c(DIM, "  the agent was not started."))
+        if prov.exists():
+            r = json.loads(prov.read_text())
+            if r.get("match_found"):
+                print(c(GRN, f"  reference {Path(r['installed']).name}  <- "
+                             f"{Path(r['source']).name}  ({r['score']}/100)"))
+            else:
+                closest = r.get("closest") or {}
+                print(c(YEL, f"  no reference: closest was "
+                             f"{closest.get('file', '?')} at "
+                             f"{(closest.get('score') or 0):.1f}, needed "
+                             f"{(r.get('threshold') or 0):.0f}"))
+        print(c(DIM, f"  receipt   {prov}"))
+        return 0
 
     approver = Approver(args.yolo)
     sess = Session(task, skill_text, workspace, run_dir, tools, approver,
@@ -1594,8 +1666,15 @@ def main():
     prov = run_dir / "reference_selection.json"
     if prov.exists():
         r = json.loads(prov.read_text())
-        print(c(DIM, f"  reference {Path(r['installed']).name}  <- "
-                     f"{Path(r['source']).name}  ({r['score']}/100)"))
+        # The receipt exists on a miss too, with nulls where the reference would
+        # be. Only --allow-no-reference gets this far with one, and that run is
+        # exactly the one that has to say out loud what it is laying against.
+        if r.get("installed"):
+            print(c(DIM, f"  reference {Path(r['installed']).name}  <- "
+                         f"{Path(r['source']).name}  ({r['score']}/100)"))
+        else:
+            print(c(YEL, "  reference NONE - step 0 found no match and the run "
+                         "was allowed to start anyway"))
     print(c(DIM, f"  approval  {'OFF (--yolo)' if args.yolo else 'on'}"))
     sess.log("start", {"task": task, "skill": args.skill, "model": model})
 

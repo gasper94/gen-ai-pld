@@ -78,10 +78,41 @@ budget than this skill has been getting. Set it deliberately.
 | 1 | the harness ran and failed or was blocked - read `out/logs/` |
 | 2 | misconfigured: missing credential, no image, several images |
 | 3 | the run finished but shipped fewer than `EXPECTED_PICKS` (default 4) |
+| 20 | no reference: nothing in the library is close enough to this garment |
 
 Fewer than four is a legitimate answer - the skill says padding a shortlist
 turns a selection into a rubber stamp - but it is not what you asked for, so it
 does not exit 0. Set `-e EXPECTED_PICKS=1` if you want any result to pass.
+
+20 is a verdict, not a fault, and it has its own code for that reason. The
+matcher looked at all 45 library images and none of them is close enough to lay
+this garment against, so a person has to upload a hero for the style. It used to
+leave as 1, which put a correct answer in the same list as an unreachable model
+server - and a failure list that fills with non-failures stops being read.
+
+Every run writes `out/result.json` with an `outcome` field - `ok`,
+`reference_selected`, `no_reference`, `short` or `error` - plus the exit code it
+came from. A caller that can only fail or succeed a step should route on that
+field and run the container with `-e NO_REFERENCE_EXIT=0`, which delivers the
+hero miss as a clean exit with the answer still in the file. Kestra is the case
+this exists for: it reds a task on any non-zero code, so "ask someone to upload a
+hero" has to arrive as data rather than as a failure.
+
+## Asking before you spend: `--reference-only`
+
+    docker run --rm -v "$PWD/inputs:/in:ro" -v "$PWD/out:/out" \
+      -v pld-cache:/app/.cache -e QWEN_API_KEY pld-harness \
+      /in/off_set_image.jpg --reference-only
+
+Runs step 0 and stops: pre-clean, match, install the reference, write the
+receipt, never start the agent. Exit 0 if the library can serve this garment, 20
+if it cannot. No fal spend, no `FAL_KEY` required, and the text model is not
+contacted at all - step 0 only talks to the vision endpoint.
+
+Whatever the answer, `/out` gets `reference_selection.json` (with `match_found`),
+`match_results.json` (every score), `result_top_matches.jpg` (what came closest)
+and `result.json`. That is the whole output of a gate step: run it first, and
+only start a generating run when it says yes.
 
 ## What the image patches, and why
 

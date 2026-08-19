@@ -28,6 +28,13 @@ Two things it insists on, both because of how the rest of the pipeline behaves:
     not deleted) unless --no-stash.
 
 Exit codes:  0 installed   2 no match, nothing installed   1 broke
+
+2 is a business outcome, not a fault: the library holds nothing close enough to
+this garment and a human has to upload a hero. It is written down as well as
+returned - reference_selection.json is produced for BOTH outcomes, carrying
+`match_found`, so a caller that routes on the answer has one file that always
+exists and always answers the same question. A receipt that appeared only on
+success would be indistinguishable from a run that died before step 0.
 """
 
 from __future__ import annotations
@@ -195,6 +202,41 @@ def main() -> int:
               f"{best.get('score', 0):.1f} (needed {a.threshold:.0f})")
         print(f"  detail     {results}")
         print("  nothing was installed; inputs/ is unchanged.")
+        # The same receipt as a successful selection, with match_found false.
+        # This is the file a caller branches on - Kestra routes a miss to a
+        # human upload request rather than failing the flow - so it has to be
+        # written on the path that produces no reference, which is exactly the
+        # path that used to write nothing at all.
+        record = {
+            "selected_at": datetime.now().isoformat(timespec="seconds"),
+            "match_found": False,
+            "query": str(query),
+            "query_md5": md5(query),
+            "query_cleaned": bool(a.query_cleaned),
+            "query_attrs": res.get("query_attrs"),
+            "library_root": res.get("library_root"),
+            "library_used": res.get("library_used"),
+            "library_count": res.get("library_count"),
+            "source": None,
+            "installed": None,
+            "score": None,
+            "threshold": res.get("threshold"),
+            "model": res.get("model"),
+            "model_confidence": res.get("model_confidence"),
+            "model_vetoed": res.get("model_vetoed"),
+            "n_qualifying": res.get("n_qualifying"),
+            # What the library came closest to holding. Whoever is being asked
+            # to upload a hero wants to see this and the contact sheet, not a
+            # bare "no match" - the near miss is often the argument for
+            # widening the category rather than shooting a new garment.
+            "closest": {"file": best.get("_file"),
+                        "score": best.get("score")},
+            "reason": (res.get("verdict") or {}).get("reason"),
+            "match_results": str(results),
+            "contact_sheet": str(run / "result_top_matches.jpg"),
+        }
+        (run / "reference_selection.json").write_text(
+            json.dumps(record, indent=2, default=str))
         C.log(run, f"reference NOT selected (best "
                    f"{best.get('score', 0):.1f} < {a.threshold:.0f})")
         return 2
@@ -229,6 +271,9 @@ def main() -> int:
 
     record = {
         "selected_at": datetime.now().isoformat(timespec="seconds"),
+        # Stated on both paths so a caller can branch on one key without having
+        # to infer the outcome from whether `installed` came back null.
+        "match_found": True,
         # Which image was actually scored, by path and by content. A run matched
         # against the cleaned upload and one matched against the raw phone photo
         # produce the same-shaped record, and this is what tells them apart

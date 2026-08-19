@@ -22,7 +22,16 @@
 #     unconditionally. Read `picks` in result.json to know how many the agent
 #     actually stood behind.
 #   * step 0 stops the run when nothing in the library scores above the
-#     reference threshold. That is a hard stop, not a warning.
+#     reference threshold. That is a hard stop, not a warning - but it is a
+#     VERDICT rather than a failure, and it now leaves the container as exit 20
+#     with `"outcome": "no_reference"` in result.json. Kestra reds a task on any
+#     non-zero code, so as written this task still shows a hero miss as a
+#     failure. The fix is a gate task in front of it: run the same image with
+#     `--reference-only` (no fal spend, no FAL_KEY, no text model), declare
+#     reference_selection.json as its outputFiles, and branch on `match_found`
+#     - generate on true, ask a human to upload a hero on false. Set
+#     NO_REFERENCE_EXIT=0 on the gate so the miss arrives as data rather than
+#     as a red task. That branch is not built here yet.
 #
 # The image is local, like lightweight-tools:debian - build it on the Kestra
 # worker first:
