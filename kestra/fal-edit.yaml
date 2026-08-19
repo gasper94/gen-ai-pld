@@ -92,6 +92,12 @@
     LAYDOWN_TASK: >-
       Follow the skill, but generate all 10 images in one call at 2K, then
       deliver with grade_flats.py --ship 4. remove all pins important prompt.
+    # Higher than the harness's own default of 40. A run generated five
+    # candidates, inspected them, and hit the cap one turn before it would have
+    # shipped - the last thing it did was crop a strap to verify it. Interactive
+    # runs have someone to notice and restart; this one has nobody, and a run
+    # that dies at the cap has already spent the whole fal bill for nothing.
+    MAX_ITERS: "80"
   entryPoint: ["/bin/bash", "-c"]
   commands:
     - |
@@ -100,4 +106,4 @@
       # outputFiles from it, so the harness delivers there rather than to /out.
       export OUT_DIR="$PWD"
       exec /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" \
-          --task "$LAYDOWN_TASK"
+          --task "$LAYDOWN_TASK" --max-iters "$MAX_ITERS"
