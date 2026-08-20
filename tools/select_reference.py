@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,39 @@ import common as C
 Image.MAX_IMAGE_PIXELS = None
 
 MATCHER = Path(__file__).with_name("match_reference.py")
+
+# Words that name how a garment is BUILT rather than how it is laid out.
+#
+# The matcher's `differences` line is the only sentence in the pipeline that
+# says what the reference has and the product does not, and it is written
+# before a penny is spent. On runs/20260819_205617 it read "the candidate
+# features a slightly more defined V-neckline and visible seam piping along the
+# edges" - and four of the ten candidates came back with a neckline seam and
+# topstitching down the straps, flagged by stage 3, at 15c each. The reference
+# is supposed to contribute pose and nothing else, so ANY construction word in
+# that line is a risk worth naming: it is not a claim that the run will fail,
+# it is the one early warning available.
+CONSTRUCTION_TERMS = (
+    "seam", "seams", "seaming", "piping", "stitch", "stitching", "topstitch",
+    "topstitching", "topstitched", "panel", "panels", "panelling", "paneling",
+    "neckline", "binding", "bound edge", "trim", "dart", "darts", "gusset",
+    "pocket", "pockets", "zip", "zipper", "closure", "logo", "label", "mesh",
+    "cutout", "cut-out", "overlay", "elastic", "hem", "cuff", "waistband",
+)
+
+
+def construction_terms(text: str | None) -> list[str]:
+    """Which construction words a differences line uses, in the order given."""
+    if not text:
+        return []
+    low = str(text).lower()
+    found = []
+    for t in CONSTRUCTION_TERMS:
+        # Whole words only: 'seam' must not fire on 'seamless', which is a
+        # fabric finish and the opposite of a construction difference.
+        if re.search(rf"(?<![a-z]){re.escape(t)}(?![a-z])", low) and t not in found:
+            found.append(t)
+    return found
 
 # The one path the pipeline reads. prepare.py takes --reference explicitly and
 # the SKILL tells the agent to pass it, so this name only has to be stable, not
@@ -89,13 +123,23 @@ def stash_other_references(inputs: Path, keep: str) -> list[str]:
     return moved
 
 
-def install(src: Path, dst: Path, greyscale: bool) -> tuple[bool, str]:
+def install(src: Path, dst: Path, greyscale: bool,
+            silhouette: bool = False) -> tuple[bool, str]:
     """Write the winner to dst. Returns (changed, description).
 
     Skips the write when the bytes would be identical, so a re-run does not
     churn the mtime - the harness fingerprints inputs by md5 and an mtime that
     moves for no reason reads as a changed input.
+
+    `silhouette` installs a line drawing of the reference's outline instead of
+    the photograph. Same pose, same arrangement, no construction to copy - see
+    common.outline_map.
     """
+    tmp_outline = None
+    if silhouette:
+        tmp_outline = dst.with_name(f".{dst.stem}.outline.jpg")
+        C.outline_map(src, tmp_outline)
+        src = tmp_outline
     with Image.open(src) as im:
         out = im.convert("L") if greyscale else im.convert("RGB")
     # Hidden, so a temp file left behind by a crash is neither stashed as a
@@ -107,9 +151,51 @@ def install(src: Path, dst: Path, greyscale: bool) -> tuple[bool, str]:
         tmp.replace(dst)
     else:
         tmp.unlink()
+    if tmp_outline and tmp_outline.exists():
+        tmp_outline.unlink()
     with Image.open(dst) as check:
         desc = f"{check.width}x{check.height} mode={check.mode}"
     return changed, desc
+
+
+def check_runner_up(query: Path, runner: dict, library: Path,
+                    a) -> tuple[Path | None, str]:
+    """Ask the model the same question about the runner-up. One vision call.
+
+    Returns (path to install, why) - path None means keep the winner. It is
+    kept unless the runner-up is BOTH still a genuine style match and free of
+    construction words, because swapping a named risk for an unmeasured one is
+    not an improvement. On the batch this was written for the runner-up scored
+    97.1 against the winner's 99.2, so the demotion is cheap when it is
+    available and worth refusing when it is not.
+    """
+    name = runner.get("_file")
+    if not name:
+        return None, "no runner-up in the ranking"
+    hits = sorted(library.rglob(name))
+    if len(hits) != 1:
+        return None, f"cannot resolve {name!r} under {library.name}"
+    alt = hits[0]
+    if runner.get("score", 0) < a.threshold:
+        return None, (f"{name} scores {runner.get('score', 0):.1f}, under the "
+                      f"{a.threshold:.0f} threshold")
+    try:
+        import match_reference as M
+        client = M.Client(M._default_base_url(), "", 180)
+        client.resolve_model()
+        v = M.compare_multi(client, M.ensure_small(query, 1024),
+                            [("A", M.ensure_small(alt, 1024))])
+    except Exception as e:  # noqa: BLE001 - a failed check keeps the winner
+        return None, f"check failed ({type(e).__name__}: {e}); keeping the winner"
+
+    if str(v.get("pick", "")).strip().lower() in ("none", ""):
+        return None, f"{name} is not the same style ('none'); keeping the winner"
+    alt_terms = construction_terms(v.get("differences"))
+    if alt_terms:
+        return None, (f"{name} names construction too "
+                      f"({', '.join(alt_terms)}); keeping the winner")
+    return alt, (f"{name} differs in no construction term "
+                 f"({v.get('differences') or 'no differences given'})")
 
 
 def main() -> int:
@@ -142,6 +228,22 @@ def main() -> int:
     ap.add_argument("--colour", "--color", dest="colour", action="store_true",
                     help="install the reference in colour; the default "
                          "desaturates it so it cannot act as a colour target")
+    ap.add_argument("--silhouette", action="store_true",
+                    help="install a line drawing of the winner's OUTLINE "
+                         "instead of the photograph. It carries the pose - "
+                         "straps crossed, band flat, legs closed - and no "
+                         "construction at all, so there is literally no seam "
+                         "or neckline for the generator to copy across. The "
+                         "strongest fix for construction bleed, and the one "
+                         "that changes what the generator sees, so it is opt-in "
+                         "until a paid batch has been run with it.")
+    ap.add_argument("--demote-on-bleed", action="store_true",
+                    help="when the winner's differences line names construction, "
+                         "ask the model the same question about the runner-up "
+                         "and install that instead if it comes back clean. One "
+                         "extra vision call, no billed images. Keeps the winner "
+                         "and says why when the runner-up is no better, which is "
+                         "the common case.")
     ap.add_argument("--no-stash", dest="stash", action="store_false",
                     help="leave any other reference* files in inputs/ alone")
     ap.add_argument("--dry-run", action="store_true",
@@ -260,14 +362,50 @@ def main() -> int:
     ranked = res.get("ranked") or []
     runner = next((r for r in ranked if r.get("_file") != res["match"]), {})
 
+    # --- construction bleed ----------------------------------------------
+    # The reference's job is the LAY. Anything it also carries - a neckline
+    # shape, piping, a seam - is something the generator can copy into a
+    # product that does not have it, and that copy is indistinguishable from a
+    # real feature by the time anyone looks at the output.
+    bleed = {"flagged": False, "terms": [], "line": verdict.get("differences"),
+             "action": "none", "detail": ""}
+    terms = construction_terms(verdict.get("differences"))
+    if terms:
+        bleed.update({"flagged": True, "terms": terms})
+        print(f"\nCONSTRUCTION BLEED RISK - the pick differs from the product in "
+              f"{len(terms)} construction term(s): {', '.join(terms)}")
+        print(f"  differences: {verdict.get('differences')}")
+        print("  The reference is a LAY reference. Anything it shows that the "
+              "product does not have can be copied into the generation, and "
+              "on a real run four of ten candidates were flagged for exactly "
+              "the seams this line named.")
+
+    if terms and a.demote_on_bleed and runner.get("_file"):
+        alt, why = check_runner_up(query, runner, library, a)
+        bleed["detail"] = why
+        print(f"  runner-up check: {why}")
+        if alt is not None:
+            src, bleed["action"] = alt, "demoted to the runner-up"
+            print(f"  DEMOTED: installing {alt.name} instead "
+                  f"({runner.get('score', 0):.1f} vs {res.get('match_score')})")
+        else:
+            bleed["action"] = "kept the winner; the runner-up was no cleaner"
+    elif terms and a.demote_on_bleed:
+        bleed["action"] = "kept the winner; no runner-up to fall back on"
+    elif terms:
+        bleed["action"] = ("silhouette installed, so nothing can be copied"
+                           if a.silhouette else "warned only")
+
     if a.dry_run:
         print(f"\nDRY RUN - would install {src} -> {dst}"
-              f"{'' if a.colour else ' (as greyscale)'}")
+              f"{'' if a.colour else ' (as greyscale)'}"
+              f"{' (as an outline map)' if a.silhouette else ''}")
         return 0
 
     a.inputs.mkdir(parents=True, exist_ok=True)
     moved = stash_other_references(a.inputs, a.name) if a.stash else []
-    changed, desc = install(src, dst, greyscale=not a.colour)
+    changed, desc = install(src, dst, greyscale=not a.colour,
+                            silhouette=a.silhouette)
 
     record = {
         "selected_at": datetime.now().isoformat(timespec="seconds"),
@@ -302,6 +440,12 @@ def main() -> int:
         "runner_up": {"file": runner.get("_file"), "score": runner.get("score")},
         "reason": verdict.get("reason"),
         "differences": verdict.get("differences"),
+        # What the reference can leak into the generation, decided before any
+        # image is paid for. generate.py reads this and hardens the prompt with
+        # the specific words; prepare.py puts them in the brief the agent
+        # writes from.
+        "construction_risk": bleed,
+        "silhouette": bool(a.silhouette),
         "match_results": str(results),
         "contact_sheet": str(run / "result_top_matches.jpg"),
     }
@@ -316,7 +460,8 @@ def main() -> int:
     print(f"  score        {res.get('match_score')}/100"
           + (f"   model confidence {res['model_confidence']}"
              if res.get("model_confidence") is not None else ""))
-    print(f"  installed    {dst}")
+    print(f"  installed    {dst}"
+          + ("   <- OUTLINE MAP, not the photograph" if a.silhouette else ""))
     print(f"               {desc}  md5:{record['installed_md5'][:8]}"
           f"{'' if changed else '  (already identical, not rewritten)'}")
     if runner:
@@ -327,12 +472,24 @@ def main() -> int:
         # between the query and the pick. The checklist has no field for most of
         # it, so this is the only place a real difference gets named.
         print(f"  differences  {record['differences']}")
+    if bleed["flagged"]:
+        print(f"  bleed risk   {', '.join(bleed['terms'])}  ->  {bleed['action']}")
+        if not a.silhouette and bleed["action"] in ("warned only",
+                                                    "kept the winner; the runner-up was no cleaner",
+                                                    "kept the winner; no runner-up to fall back on"):
+            print("               generate.py will name these in the prompt and "
+                  "tell the model not to copy them. Stronger, if this keeps "
+                  "happening: re-run this with --silhouette, which installs an "
+                  "outline and leaves nothing to copy.")
     for m in moved:
         print(f"  stashed      {m}")
     print(f"  provenance   {prov}")
 
     C.log(run, f"reference {src.name[:28]} ({res.get('match_score')}/100)"
-               + ("" if a.query_cleaned else " vs RAW query"))
+               + ("" if a.query_cleaned else " vs RAW query")
+               + (f", bleed risk: {','.join(bleed['terms'][:3])}"
+                  if bleed["flagged"] else "")
+               + (" [outline]" if a.silhouette else ""))
     return 0
 
 

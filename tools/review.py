@@ -25,15 +25,18 @@ import cutout
 def why_line(c: dict, grade_schema: bool) -> str:
     """One line of evidence for a candidate, in whichever grader's terms.
 
-    grade_flats.py measures shape, wrinkles and construction; the measure.py it
+    grade_flats.py measures fidelity to the cleaned source - silhouette IoU,
+    colour drift, texture distance - and construction; the measure.py it
     replaced measured colour drift and rigid dimensions. Printing one set of
     column names over the other grader's numbers is how a run ends up quoting
     figures nobody computed.
     """
     if grade_schema:
         con = [k for k in c.get("construction", []) if k.get("verdict") == "MISMATCH"]
-        return (f"grade {c['score']:.1f}  shape {c.get('shape', 0):.0f}  "
-                f"wrinkles {c.get('wrinkles', 0):.0f}  bg {c.get('background', 0):.0f}"
+        t = c.get("terms") or {}
+        return (f"grade {c['score']:.1f}  silhouette {t.get('silhouette', 0):.0f}  "
+                f"colour {t.get('colour', 0):.0f}  wrinkle {t.get('wrinkle', 0):.0f}  "
+                f"bg {t.get('background', 0):.0f}"
                 + (f"  construction altered in {len(con)} region(s)" if con else ""))
     return (f"score {c['score']:6.1f}  colour {c['colour_drift']:.1f}  "
             f"len {c['len_pct']:+.1f}%  top {c['topw_pct']:+.1f}%"
@@ -217,11 +220,13 @@ def main() -> int:
               for s in sheets] or ["- (none built)"]
         L += ["", "## Every candidate", ""]
         if grade_schema:
-            L += ["| candidate | grade | shape | wrinkles | bg | construction | verdict |",
-                  "|---|---|---|---|---|---|---|"]
+            L += ["| candidate | grade | silhouette | colour | wrinkle | bg | "
+                  "construction | verdict |",
+                  "|---|---|---|---|---|---|---|---|"]
             for c in m["candidates"]:
                 con = [k for k in c.get("construction", [])
                        if k.get("verdict") == "MISMATCH"]
+                t = c.get("terms") or {}
                 # The reject reason is a paragraph per altered region. In a table
                 # cell it pushes every other column off the screen, so name the
                 # regions here and leave the detail to grade_results.json.
@@ -229,8 +234,9 @@ def main() -> int:
                      else "BELOW pass mark" if c["reject"]
                      else "PICKED" if c["cand"] in stems else "eligible")
                 L.append(f"| `{c['cand']}` | {c['score']:.1f} | "
-                         f"{c.get('shape', 0):.0f} | {c.get('wrinkles', 0):.0f} | "
-                         f"{c.get('background', 0):.0f} | "
+                         f"{t.get('silhouette', 0):.0f} | {t.get('colour', 0):.0f} | "
+                         f"{t.get('wrinkle', 0):.0f} | "
+                         f"{t.get('background', 0):.0f} | "
                          f"{'intact' if not con else str(len(con)) + ' altered'}"
                          f" | {v} |")
             L += ["", "Per-region detail for every MISMATCH is in "

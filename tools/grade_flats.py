@@ -9,30 +9,46 @@ Replaces measure.py and the by-eye contact-sheet review that used to follow it.
 
 Why it is built this way
   Instruct-edit models re-synthesize the subject rather than editing pixels, so
-  every candidate is a fresh chance to invent a seam or move a pocket. Invented
-  detail is usually plausible, so it survives casual review. Two consequences
-  shape this script:
-    - photometric metrics (background, symmetry, smoothness) say NOTHING about
-      construction. A candidate can win on every metric and still be a fake.
-      So construction is a separate gate, not a score component.
-    - vision judges are noisy; the same image can score 100 then 60 after a
-      rescale. So each grade is a majority of N independent votes.
+  every candidate is a fresh chance to invent a seam, shift a neckline or
+  repaint a colourway. Invented detail is usually plausible, so it survives
+  casual review. The grade therefore measures FIDELITY to the cleaned source -
+  is this still the same garment - and not presentation polish.
+
+  That is a correction, and an expensive one. The grade used to be 45% shape +
+  45% wrinkles + 10% background, with wrinkles ranked WITHIN the batch. On
+  runs/20260819_205617 that put the plastic-smooth redraws at the top (79.1 and
+  71.4) and the faithful re-lays at the bottom (16.6 and 18.8) - exactly upside
+  down against both the contact sheet and stage 3. Two faults did it: a
+  batch-relative smoothness term rewards whichever candidate ironed the fabric
+  hardest, and nothing in the formula compared the candidate to the source at
+  all.
 
 Stages
-  1. Deterministic metrics, no model: garment mask, symmetry about the garment's
-     own axis, local-variance wrinkle energy, background flatness and lightness.
+  1. Deterministic measurement against the cleaned source, no model:
+       silhouette IoU   the candidate's outline against the source's, both
+                        normalised to their own bounding boxes so a legitimate
+                        rescale or re-centre costs nothing. 35% of the grade.
+       colour drift     dE76 between the two garment colours. 20%.
+       wrinkle delta    distance from the SOURCE's own texture energy, not from
+                        the batch's smoothest. 20%.
+       symmetry         the silhouette against its own mirror. 15%.
+       background       backdrop lightness, measured. 10%.
      Free, repeatable, cannot hallucinate.
-  2. Vision grading, --votes independent calls per candidate, median taken.
-     Expected edits (background swap, relight, de-wrinkling, reframing) are
-     declared up front as NOT defects, or the judge reports them as failures.
+  2. Vision grading, --votes independent calls per candidate. ADVISORY ONLY -
+     see --judge. Both model modes measured badly on this project (one
+     saturated at 100/100, the other picked by slot), so they no longer feed
+     the grade; they print beside it.
   3. Construction check on native-resolution crops against the reference. Any
-     MISMATCH disqualifies regardless of how clean it looks. Which regions get
+     MISMATCH marks the candidate REJECT *and* costs it a fixed penalty per
+     altered region, so the number and the label finally say the same thing -
+     a run once had to arbitrate between a 79.1 grade and three MISMATCH flags
+     on the same image, and spent thirty turns doing it. Which regions get
      cropped follows the garment: the profile is read from the garment_type in
      <run>/reference_selection.json, so grading a bra with the leggings bands is
      not something a forgotten flag can cause.
 
-Two notes carried over from the pipeline this replaces, because they were paid
-for here and the code above does not encode them:
+Three notes carried over, because they were paid for here and the code does not
+encode them:
 
   * The reference MUST be <run>/archive/offset_upload.jpg, the cleaned image the
     generator actually received - never inputs/off_set_image.jpg. The raw input
@@ -40,18 +56,23 @@ for here and the code above does not encode them:
     the correctly-removed tag as "a label removed" on every candidate. That is
     why --reference defaults off the run folder and not off inputs/.
 
-  * `wrinkles` here is an isotropic local-variance measure. common.py records
-    that a metric of exactly this class was tried on this project and removed:
-    it ranked the visibly smoothest candidate of a real run highest, because it
-    was reading the garment's form shading rather than its creases. It is
-    batch-relative and worth 45% of the grade, so treat a wrinkle ranking that
-    disagrees with the contact sheet as the metric being wrong, not the sheet.
+  * Anything the CLEAN step legitimately removed - pins, clips, a tag - is a
+    difference stage 3 will find and call a defect unless it is told. Pass
+    --expected-changes "pearl-headed pins removed" and it is declared as
+    correct. On the run this was written for, three pearl-headed pins survived
+    into the source, every candidate correctly dropped them, and all ten came
+    back MISMATCH on every region for it.
+
+  * Every measurement here is taken inside common.py's garment mask, which
+    finds a pale garment by CHROMA rather than by brightness. The luminance
+    rule it replaced collapsed to a 3% strip of frame on three candidates of
+    that same run, and the metrics taken off it were confident nonsense.
 
 ImageMagick + sips + the project venv. Vision helpers come from vision.py.
 
 Usage
   python tools/grade_flats.py --run runs/<stamp>
-  python tools/grade_flats.py --run runs/<stamp> --votes 5 --min-grade 85
+  python tools/grade_flats.py --run runs/<stamp> --expected-changes "pins removed"
   python tools/grade_flats.py --run runs/<stamp> --no-construction
 """
 
@@ -60,7 +81,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import re
 import shutil
 import statistics
 import subprocess
@@ -82,6 +102,19 @@ FONT = "/System/Library/Fonts/Supplemental/Arial.ttf"
 NORM_BBOX_H = 900
 
 RES_ORDER = {"1K": 1, "2K": 2, "4K": 3}
+
+# What the grade is made of. Fidelity to the source carries 75% of it between
+# silhouette, colour and texture, because those are the three ways a
+# re-synthesised garment stops being the product while still photographing
+# well. Symmetry and background are presentation and are what is left.
+WEIGHTS = {"silhouette": 0.35, "colour": 0.20, "wrinkle": 0.20,
+           "symmetry": 0.15, "background": 0.10}
+
+# What stage 3 asks. Part of every stored verdict's fingerprint, so adding a
+# question re-judges rather than reusing answers to the old one.
+#   1  construction per region
+#   2  + orientation, on the profile's face region
+STAGE3_VERSION = 2
 
 
 def auto_select(arch: Path):
@@ -119,85 +152,69 @@ def _fx(args: list[str]) -> float:
     return float(out.stdout.strip())
 
 
-def _bbox(mask: Path) -> tuple[int, int, int, int]:
-    """Bounding box of the mask's non-background content, or zeros.
+def backdrop(src: Path, width: int = 800) -> dict:
+    """Lightness and flatness of the plate, from a corner of the frame.
 
-    identify's %@ comes back empty for an all-one-colour mask, which the
-    original indexed into unguarded and died on.
+    Deliberately mask-free: it is the one measurement that must keep working
+    when the garment cannot be found at all. Measured rather than judged - the
+    vision model rated a visibly grey backdrop 100/100.
     """
-    geom = subprocess.run(["magick", "identify", "-format", "%@", str(mask)],
-                          check=True, capture_output=True, text=True).stdout.strip()
-    m = re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", geom)
-    return tuple(int(g) for g in m.groups()) if m else (0, 0, 0, 0)
+    crop = [str(src), "-resize", f"{width}x", "-gravity", "northwest",
+            "-crop", "60x60+0+0", "+repage", "-colorspace", "Gray"]
+    return {"bg_sd": round(_fx(crop + ["-format", "%[fx:standard_deviation]", "info:"]), 4),
+            "bg_lum": round(_fx(crop + ["-format", "%[fx:mean]", "info:"]), 4)}
 
 
-def metrics(src: Path, width: int = 800) -> dict:
-    """Photometric + geometric measurements. These rank presentation quality.
-    They deliberately say nothing about whether the garment is still the same
-    garment - that is stage 3's job."""
-    WORK.mkdir(parents=True, exist_ok=True)
-    stem = src.stem
-    mask = WORK / f"{stem}_mask.png"
-    core = WORK / f"{stem}_core.png"
-    trim = WORK / f"{stem}_trim.png"
+def measure(src: Path, ref: dict | None = None,
+            ref_mask=None) -> tuple[dict, "object"]:
+    """Everything stage 1 knows about one image, and the mask it was taken over.
 
-    # Otsu adapts the garment/background split per image, so a grey backdrop
-    # does not silently swallow part of the garment.
-    subprocess.run(["magick", str(src), "-resize", f"{width}x", "-colorspace", "Gray",
-                    "-auto-threshold", "OTSU", "-negate", str(mask)],
-                   check=True, capture_output=True)
-    subprocess.run(["magick", str(mask), "-trim", "+repage", str(trim)],
-                   check=True, capture_output=True)
-    subprocess.run(["magick", str(mask), "-morphology", "Erode", "Disk:6", str(core)],
-                   check=True, capture_output=True)
+    `ref` is the reference's own measurement dict and `ref_mask` its mask; pass
+    neither for the reference itself. With them, the three fidelity numbers
+    appear - silhouette IoU, colour drift and the wrinkle delta - because all
+    three are differences and none of them means anything about a single image
+    on its own.
 
-    coverage = _fx([str(mask), "-format", "%[fx:mean]", "info:"])
-    core_frac = max(_fx([str(core), "-format", "%[fx:mean]", "info:"]), 1e-6)
-
-    # Garment bbox, used to put every image on the same fabric-pixels-per-inch
-    # footing before measuring texture. Without this the metric mostly reports
-    # source resolution: a 3072px original downscaled to 800 is smoother than a
-    # 1792px one at the same output width, purely from the heavier resample.
-    bw0, bh0, _, _ = _bbox(mask)
-    norm = WORK / f"{stem}_norm.png"
-    norm_mask = WORK / f"{stem}_normcore.png"
-    scale_pct = 100.0 * NORM_BBOX_H / max(bh0, 1)
-    subprocess.run(["magick", str(src), "-resize", f"{width}x",
-                    "-resize", f"{scale_pct:.3f}%", "-colorspace", "Gray", str(norm)],
-                   check=True, capture_output=True)
-    subprocess.run(["magick", str(core), "-resize", f"{scale_pct:.3f}%", str(norm_mask)],
-                   check=True, capture_output=True)
-    norm_core_frac = max(_fx([str(norm_mask), "-format", "%[fx:mean]", "info:"]), 1e-6)
-
-    # Mirror about the garment's own bounding box, not the frame: otherwise a
-    # perfectly symmetric garment sitting off-centre scores as asymmetric.
-    asym = _fx([str(trim), "(", "+clone", "-flop", ")",
-                "-compose", "difference", "-composite", "-format", "%[fx:mean]", "info:"])
-
-    # Wrinkles show up as local luminance variance inside the garment. The mask
-    # is eroded first so the garment/background edge does not dominate, and the
-    # measurement runs on the scale-normalised copy.
-    wr_sum = _fx([str(norm), "-statistic", "StandardDeviation", "5x5", str(norm_mask),
-                  "-compose", "multiply", "-composite", "-format", "%[fx:mean]", "info:"])
-
-    bg_sd = _fx([str(src), "-resize", f"{width}x", "-gravity", "northwest",
-                 "-crop", "60x60+0+0", "+repage", "-colorspace", "Gray",
-                 "-format", "%[fx:standard_deviation]", "info:"])
-    bg_lum = _fx([str(src), "-resize", f"{width}x", "-gravity", "northwest",
-                  "-crop", "60x60+0+0", "+repage", "-colorspace", "Gray",
-                  "-format", "%[fx:mean]", "info:"])
-
-    bw, bh, bx, by = _bbox(mask)
-
-    return {
-        "coverage": round(coverage, 4),
-        "asymmetry": round(asym, 4),
-        "wrinkle_energy": round(wr_sum / norm_core_frac, 5),
-        "bg_sd": round(bg_sd, 4),
-        "bg_lum": round(bg_lum, 4),
-        "bbox": [bw, bh, bx, by],
-        "aspect": round(bw / bh, 4) if bh else 0.0,
+    Every number here is taken inside common.py's garment mask, so the `cue`
+    field is part of the record: a measurement is only as good as the pixels it
+    was taken over, and this batch is why that sentence is in the file.
+    """
+    e = C.garment_evidence(src)
+    m = e["mask"]
+    out = {
+        "cue": e["cue"],
+        "coverage": round(e["area"], 4),
+        "aspect": e["aspect"],
+        "bbox": e["bbox"],
+        "chroma_threshold": e["chroma_threshold"],
+        "chroma_inside": e["chroma_inside"],
+        "luma_contrast": e["luma_contrast"],
+        **backdrop(src),
     }
+    if not m.any():
+        return {**out, "symmetry": 0.0, "asymmetry": 1.0, "wrinkle_energy": 0.0,
+                "rgb": [0.0, 0.0, 0.0], "found": False}, m
+
+    sym = C.shape_stats(m)["symmetry"]
+    rgb = C.garment_rgb(src, m)
+    out.update({
+        "found": True,
+        "symmetry": round(float(sym), 4),
+        # Kept under its old name so a reader comparing two runs is comparing
+        # the same quantity; it is now measured on the chroma mask.
+        "asymmetry": round(1.0 - float(sym), 4),
+        "wrinkle_energy": round(C.wrinkle_energy(src, m, NORM_BBOX_H), 4),
+        "rgb": [round(float(v), 1) for v in rgb],
+    })
+    if ref and ref.get("found") and ref_mask is not None:
+        drift = C.colour_drift(rgb, ref["rgb"])
+        out.update({
+            "silhouette_iou": round(C.silhouette_iou(m, ref_mask), 4),
+            "colour_de": round(drift["de"], 3),
+            "colour_drgb": round(drift["drgb"], 3),
+            "wrinkle_delta": round(out["wrinkle_energy"] - ref["wrinkle_energy"], 4),
+        })
+    return out, m
 
 
 # --------------------------------------------------------------------------
@@ -213,6 +230,7 @@ is a defect, do not deduct for them:
   - the garment straightened, re-centred, re-framed or rescaled
   - creases and rumples relaxed - that is the entire point of the edit
   - hangtags, pins, props or clips removed
+%EXPECTED%
 
 Grade the CANDIDATE as an ecommerce product flat, on two axes.
 
@@ -244,15 +262,111 @@ construction detail. That is what you are looking for, and only that.
 Expected differences that are NOT discrepancies: background colour, brightness,
 shadow softness, scale, rotation, position in frame, overall sharpness, and the
 fabric lying flatter or smoother.
-
+%EXPECTED%
 Report ONLY genuine construction differences: seams that were added or removed,
 topstitching that appeared or vanished, a pocket or its opening moved or resized,
 a waistband changed in height or structure, a hem or cuff changed in shape,
 a logo/label added, removed or altered.
-
+%FACE%
 Return ONE JSON object, nothing else:
 {{"verdict": "MATCH" | "MISMATCH",
-  "detail": "<the specific construction difference, or 'none'>"}}"""
+  "detail": "<the specific construction difference, or 'none'>"%FACEKEY%}}"""
+
+# A flip is invisible to every other test in the pipeline. The silhouette is
+# near-symmetric, the colour is identical, the texture is identical, and every
+# seam can be individually correct while the garment shows its reverse face. On
+# runs/20260819_223347 the agent's own prompt said "the garment is shown from
+# the back" and the model did as it was told; stage 3 then reported
+# topstitching that had "appeared", which was the other face's real stitching,
+# seen for the first time.
+#
+# This is asked of ONE image at a time, and the answers are compared afterwards.
+# The obvious cheaper design - fold "is this the same face as image 1?" into a
+# construction call that shows both crops - was built first and measured blind:
+# handed a candidate MIRRORED left-for-right, it answered SAME, with a confident
+# sentence about the exterior construction being visible in both. Shown the two
+# images together the model reconciles them; asked to describe one image it
+# observes it. The same positive control run against the question below flips
+# its answer, which is the only reason this one is trusted.
+FACE_PROBE = """This is a flat product photograph of one garment.
+
+Are you looking at the OUTSIDE of the garment (the face a customer sees when it
+is worn) or the INSIDE (the lining, seam allowances, interior elastic, care
+labels - the face against the body)?
+
+Then, separately: is the side facing you the FRONT of the garment or the BACK?
+
+Return ONE JSON object, nothing else:
+{"face": "OUTSIDE" | "INSIDE" | "CANNOT TELL",
+ "side": "FRONT" | "BACK" | "CANNOT TELL",
+ "why": "<one short sentence naming what told you>"}"""
+
+
+def face_of(client: Client, small: Path) -> dict:
+    """Which face and which side of the garment this image shows."""
+    try:
+        v = parse_json_blob(client.chat(
+            [image_part(small), text_part(FACE_PROBE)],
+            max_tokens=250, temperature=0.0))
+    except Exception as e:  # noqa: BLE001 - a dropped probe is not a flip
+        return {"face": "CANNOT TELL", "side": "CANNOT TELL",
+                "why": f"probe failed: {type(e).__name__}"}
+    return {"face": str(v.get("face", "CANNOT TELL")).strip().upper(),
+            "side": str(v.get("side", "CANNOT TELL")).strip().upper(),
+            "why": str(v.get("why", ""))[:200]}
+
+
+def face_verdict(ref_face: dict, cand_face: dict) -> dict:
+    """Is this candidate showing a different face from the source?
+
+    Only a definite disagreement counts. CANNOT TELL on either side is not
+    evidence of anything, and a 15-point penalty on a coin flip would be worse
+    than not asking - the model reasons partly from what garments of this type
+    usually look like, so its `why` is recorded with every flag and a flag is
+    meant to be appealable.
+    """
+    out = {**cand_face, "flipped": False, "differs": ""}
+    for key, label in (("side", "front/back"), ("face", "outside/inside")):
+        a, b = ref_face.get(key), cand_face.get(key)
+        if a in ("CANNOT TELL", None) or b in ("CANNOT TELL", None) or a == b:
+            continue
+        out["flipped"] = True
+        out["differs"] = (f"{label}: the source reads {a}, this reads {b}"
+                          + (f" - {cand_face.get('why','')}" if cand_face.get("why") else ""))
+        break
+    return out
+
+
+def with_face(prompt: str, ask: bool = False) -> str:
+    """Take the folded-question markers back out of the construction prompt.
+
+    The markers stay in the template because the folded form is worth keeping
+    documented as something that was tried, measured and rejected - see the
+    comment above FACE_PROBE.
+    """
+    return prompt.replace("%FACE%\n", "").replace("%FACEKEY%", "")
+
+
+def with_expected(prompt: str, expected: str) -> str:
+    """Declare what the clean step legitimately removed, so its absence is not
+    reported as a defect.
+
+    Nothing else in the pipeline can tell the judge this. The cleaned source is
+    what stage 3 compares against, so anything the clean was SUPPOSED to remove
+    but did not - a pin it missed, a tag the guard refused to erase - is present
+    in the reference, absent from every candidate, and reported as a
+    discrepancy on all of them. That is what happened on
+    runs/20260819_205617: three pearl-headed pins survived the clean, all ten
+    candidates correctly left them out, and all thirty region verdicts came back
+    MISMATCH. Ten paid-for images and thirty vision calls, none of which said
+    anything about the garment.
+    """
+    if not expected:
+        return prompt.replace("%EXPECTED%\n", "")
+    return prompt.replace("%EXPECTED%",
+                          f"\nAlso EXPECTED and NOT a defect - the clean-up step removed these\n"
+                          f"before the candidate was made, so their absence is CORRECT:\n"
+                          f"  {expected}\n")
 
 
 PAIR_PROMPT = """Image 1 is the REFERENCE: the real garment, photographed flat as-is.
@@ -344,20 +458,22 @@ def run_tournament(client: Client, ref_small: Path, rows: list[dict],
     return {"position_picks": pos_pick, "bouts": reasons}
 
 
-def grade_once(client: Client, ref_small: Path, cand_small: Path) -> dict:
+def grade_once(client: Client, ref_small: Path, cand_small: Path,
+               expected: str = "") -> dict:
     content = [text_part("Image 1 - REFERENCE:"), image_part(ref_small),
                text_part("Image 2 - CANDIDATE:"), image_part(cand_small),
-               text_part(GRADE_PROMPT)]
+               text_part(with_expected(GRADE_PROMPT, expected))]
     return parse_json_blob(client.chat(content, max_tokens=400, temperature=0.0))
 
 
-def grade_voted(client: Client, ref_small: Path, cand_small: Path, votes: int) -> dict:
+def grade_voted(client: Client, ref_small: Path, cand_small: Path, votes: int,
+                expected: str = "") -> dict:
     """Median of N independent grades. A single vision score is noisy evidence,
     not a measurement, so one call is never enough to rank on."""
     got = []
     for _ in range(votes):
         try:
-            got.append(grade_once(client, ref_small, cand_small))
+            got.append(grade_once(client, ref_small, cand_small, expected))
         except Exception:  # noqa: BLE001 - a dropped vote is survivable
             continue
     if not got:
@@ -404,24 +520,26 @@ REGIONS_BY_PROFILE = {
 }
 
 
-def crop_region(src: Path, span: tuple[float, float], tag: str) -> Path:
-    """Crop at native resolution. Judging a whole 2K frame downscaled into the
-    model loses exactly the fine detail this check exists to find."""
-    WORK.mkdir(parents=True, exist_ok=True)
-    mask = WORK / f"{src.stem}_mask.png"
-    if not mask.exists():
-        metrics(src)
-    bw, bh, bx, by = _bbox(mask)
-    if bh == 0:
-        raise RuntimeError(f"no garment found in {src.name}")
+def crop_region(src: Path, box: tuple[int, int, int, int],
+                span: tuple[float, float], tag: str) -> Path:
+    """Crop a band of the garment at native resolution. Judging a whole 2K frame
+    downscaled into the model loses exactly the fine detail this check exists to
+    find.
 
-    full_w = int(subprocess.run(["magick", "identify", "-format", "%w", str(src)],
-                                check=True, capture_output=True, text=True).stdout)
-    mask_w = int(subprocess.run(["magick", "identify", "-format", "%w", str(mask)],
-                                check=True, capture_output=True, text=True).stdout)
-    s = full_w / mask_w                       # mask was measured at 800px wide
-    x, y = int(bx * s), int((by + span[0] * bh) * s)
-    w, h = int(bw * s), int((span[1] - span[0]) * bh * s)
+    `box` is the garment's own bounding box in this image's pixels, and it is
+    passed in rather than measured here so that both sides of a comparison are
+    taken from boxes that were checked against each other. A band is a FRACTION
+    of that box: get the box wrong by 10x, as the old luminance mask did on
+    three candidates of runs/20260819_205617, and 'straps' lands on the band
+    while the judge answers confidently about the wrong fabric.
+    """
+    WORK.mkdir(parents=True, exist_ok=True)
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    if bh <= 0 or bw <= 0:
+        raise RuntimeError(f"no garment found in {src.name}")
+    x, y = int(x0), int(y0 + span[0] * bh)
+    w, h = int(bw), int((span[1] - span[0]) * bh)
 
     out = WORK / f"{src.stem}_{tag}.jpg"
     subprocess.run(["magick", str(src), "-crop", f"{w}x{h}+{x}+{y}", "+repage",
@@ -437,15 +555,26 @@ def region_spec(regions: dict) -> str:
     return "|".join(f"{n}:{a:.3f}-{b:.3f}" for n, (a, b) in regions.items())
 
 
-def fingerprint(cand: Path, ref: Path, profile: str, regions: dict) -> dict:
+def fingerprint(cand: Path, ref: Path, profile: str, regions: dict,
+                expected: str = "") -> dict:
     """What a stored verdict has to agree with before it can be reused.
 
     Content hashes, not filenames or mtimes: cand_02.png regenerated under the
     same name is a different image and must be re-judged, while the same bytes
     re-graded on a later pass are not.
+
+    --expected-changes is part of it because it changes the question. A verdict
+    taken before "the pins were removed on purpose" was declared answers a
+    different question from one taken after, and reusing the first would leave
+    the flag it exists to clear sitting in the record.
     """
     return {"cand_md5": C.md5(cand), "ref_md5": C.md5(ref),
-            "profile": profile, "regions": region_spec(regions)}
+            "profile": profile, "regions": region_spec(regions),
+            "expected_changes": expected,
+            # Bumped whenever the questions change. A verdict taken before the
+            # orientation question existed does not carry an answer to it, and
+            # reusing one would silently mark a flipped candidate as clean.
+            "stage3": STAGE3_VERSION}
 
 
 def load_cache(arch: Path) -> dict:
@@ -465,21 +594,28 @@ def load_cache(arch: Path) -> dict:
     return got if isinstance(got, dict) else {}
 
 
-def check_construction(client: Client, ref: Path, cand: Path, regions: dict) -> list[dict]:
+def check_construction(client: Client, ref: Path, cand: Path, regions: dict,
+                       ref_box, cand_box, expected: str = "") -> list[dict]:
     out = []
     for i, (name, span) in enumerate(regions.items()):
         tag = f"r{i}"
         try:
-            rc = crop_region(ref, span, tag)
-            cc = crop_region(cand, span, tag)
+            rc = crop_region(ref, ref_box, span, tag)
+            cc = crop_region(cand, cand_box, span, tag)
         except Exception as e:  # noqa: BLE001
             out.append({"verdict": "ERROR", "detail": str(e)[:120], "region": name})
             continue
         content = [text_part(f"Image 1 - REFERENCE {name}:"), image_part(rc),
                    text_part(f"Image 2 - GENERATED {name}:"), image_part(cc),
-                   text_part(CONSTRUCTION_PROMPT.format(region=name))]
+                   # Formatted first, then the expected-changes text is pasted
+                   # in: it is operator input and may contain braces of its own,
+                   # which .format() would try to read as a field.
+                   text_part(with_face(
+                       with_expected(CONSTRUCTION_PROMPT.format(region=name),
+                                     expected)))]
         try:
-            v = parse_json_blob(client.chat(content, max_tokens=250, temperature=0.0))
+            v = parse_json_blob(client.chat(content, max_tokens=250,
+                                            temperature=0.0))
         except Exception as e:  # noqa: BLE001
             v = {"verdict": "ERROR", "detail": str(e)[:120]}
         v["region"] = name
@@ -487,17 +623,76 @@ def check_construction(client: Client, ref: Path, cand: Path, regions: dict) -> 
     return out
 
 
+def flipped(r: dict) -> dict | None:
+    """This candidate's face verdict, if it says the wrong face is showing."""
+    f = r.get("face") or {}
+    return f if f.get("flipped") else None
+
+
 # --------------------------------------------------------------------------
 
 def normalise(vals: list[float], lower_is_better: bool) -> list[float]:
-    """Map a raw metric onto 0-100 within this batch. Relative by construction:
-    with everything equally good the spread is meaningless, so these are shown
-    as context and used for tie-breaking, never as the headline grade."""
+    """Map a raw metric onto 0-100 within this batch.
+
+    Batch-relative by construction, so 100 means "best of these" and nothing
+    more. It is kept for the two starred context columns and is deliberately no
+    longer part of the grade: as the headline wrinkle term it handed 100/100 to
+    whichever candidate had ironed the fabric flattest, which on
+    runs/20260819_205617 was a redraw with three altered regions.
+    """
     lo, hi = min(vals), max(vals)
     if hi - lo < 1e-9:
         return [100.0] * len(vals)
     out = [(v - lo) / (hi - lo) for v in vals]
     return [round((1 - o if lower_is_better else o) * 100, 1) for o in out]
+
+
+def band(value: float, best: float, worst: float) -> float:
+    """A measurement onto 0-100 between two ANCHORS, not between its neighbours.
+
+    Anchored scoring is the point: it survives a batch where everything is bad,
+    which batch-relative scoring cannot - four ranked images look identical
+    whether they are four good ones or four terrible ones.
+    """
+    span = best - worst
+    if abs(span) < 1e-9:
+        return 100.0
+    return max(0.0, min(100.0, (value - worst) / span * 100))
+
+
+def score_row(m: dict, args, ref_wrinkle: float) -> dict:
+    """The five measured terms of one candidate, each 0-100.
+
+    Anchors, and where they come from - all measured on runs/20260819_205617,
+    ten 2K candidates of a mint bralette, the only batch this has been
+    calibrated against:
+
+      silhouette  IoU 0.95 scores 100, 0.70 scores 0. A re-lay cannot score 1.0
+                  and should not: closing the straps is the job. The faithful
+                  candidates measured 0.85-0.88 there and the redrawn ones
+                  0.77-0.81.
+      colour      dE76 1.0 or under scores 100 (invisible), 6.0 scores 0 (a
+                  different colourway). Faithful 1.5-3.0, redrawn 3.8-5.3.
+      wrinkle     distance from the source's own texture energy, tolerated up
+                  to --wrinkle-tol of it in EITHER direction. Rougher means
+                  creases the re-lay failed to relax; smoother means the knit
+                  was ironed out of existence, which is the failure the old
+                  batch-relative term rewarded.
+      symmetry    mirror IoU of the silhouette against itself, 1.00 to
+                  --sym-floor. Presentation, not fidelity - a redraw is usually
+                  MORE symmetric than the real thing, which is why it is 15%.
+      background  the plate this pipeline actually produces, which sweeps
+                  228-252 and never reaches pure white.
+    """
+    tol = max(args.wrinkle_tol * ref_wrinkle, 1e-6)
+    return {
+        "silhouette": round(band(m.get("silhouette_iou", 0.0),
+                                 args.iou_ceiling, args.iou_floor), 1),
+        "colour": round(band(m.get("colour_de", 99.0), args.de_free, args.de_max), 1),
+        "wrinkle": round(band(abs(m.get("wrinkle_delta", tol)), 0.0, tol), 1),
+        "symmetry": round(band(m.get("symmetry", 0.0), 1.0, args.sym_floor), 1),
+        "background": round(band(m.get("bg_lum", 0.0), args.bg_white, args.bg_floor), 1),
+    }
 
 
 def build_sheet(ref_small: Path, rows: list[dict], out: Path) -> Path:
@@ -544,6 +739,9 @@ def write_metrics_json(arch: Path, rows: list[dict], ref: Path, args,
         "reference": str(ref),
         "min_grade": args.min_grade,
         "judge": args.judge,
+        "weights": WEIGHTS,
+        "construction_penalty": args.construction_penalty,
+        "expected_changes": args.expected_changes,
         # Which regions the construction verdicts below were taken on, and
         # whether that was read from the run or assumed. A verdict read without
         # this cannot be checked afterwards.
@@ -554,16 +752,28 @@ def write_metrics_json(arch: Path, rows: list[dict], ref: Path, args,
             "file": str(r["path"]),
             "score": r["grade"],
             "grade": r["grade"],
+            "grade_before_penalty": r["base"],
+            "penalty": r["penalty"],
             "status": r["status"],
             "reject": r["status"] != "PASS",
             "reject_why": "; ".join(r["notes"]) if r["status"] != "PASS" else "",
-            "shape": r["shape"],
-            "wrinkles": r["wrinkles"],
-            "background": r["background"],
-            "symmetry": round(1.0 - r["metrics"]["asymmetry"], 3),
-            "asymmetry": r["metrics"]["asymmetry"],
-            "wrinkle_energy": r["metrics"]["wrinkle_energy"],
-            "bg_lum": r["metrics"]["bg_lum"],
+            # The five measured terms, each 0-100, in the weights above.
+            "terms": r["terms"],
+            # ... and the raw measurements they were scored from, so a number in
+            # `## Results` can be checked rather than taken on trust.
+            "silhouette_iou": r["metrics"].get("silhouette_iou"),
+            "colour_de": r["metrics"].get("colour_de"),
+            "colour_drgb": r["metrics"].get("colour_drgb"),
+            "wrinkle_energy": r["metrics"].get("wrinkle_energy"),
+            "wrinkle_delta": r["metrics"].get("wrinkle_delta"),
+            "symmetry": r["metrics"].get("symmetry"),
+            "asymmetry": r["metrics"].get("asymmetry"),
+            "bg_lum": r["metrics"].get("bg_lum"),
+            "rgb": r["metrics"].get("rgb"),
+            "mask_cue": r["metrics"].get("cue"),
+            "vision": r.get("vision"),
+            "flipped": r.get("flipped", False),
+            "face": r.get("face", {}),
             "construction": r.get("construction", []),
             # Judged this pass, or reused from a previous one. `## Results` can
             # then say when the flags it quotes were actually decided.
@@ -599,22 +809,54 @@ def main() -> int:
                          "waistband or hem, so the leggings bands land on plate.")
     ap.add_argument("--judge", choices=["metrics", "tournament", "absolute"],
                     default="metrics",
-                    help="how shape/wrinkles are scored. 'metrics' (default) uses "
-                         "the deterministic measurements. 'tournament' has the model "
-                         "compare pairs - showed 100%% position bias here. 'absolute' "
-                         "asks for 0-100 rubric scores - saturated at 100 for every "
-                         "candidate here. Both model modes are kept for re-testing "
-                         "on a better model.")
+                    help="whether to ALSO ask the vision model, and how. The grade "
+                         "itself is always the measurements: 'tournament' showed "
+                         "100%% position bias here and 'absolute' saturated at "
+                         "100/100 for every candidate including one with a visibly "
+                         "grey backdrop, so neither is allowed near the score. "
+                         "They print beside it, for re-testing on a better model.")
     ap.add_argument("--votes", type=int, default=3,
                     help="independent grading calls per candidate, median taken "
                          "(default 3; vision scores are too noisy for one)")
-    ap.add_argument("--min-grade", "--threshold", type=float, default=80.0,
-                    metavar="GRADE", help="below this a candidate is not shippable "
-                                          "(default 80)")
-    ap.add_argument("--asym-anchor", type=float, default=0.06,
-                    help="asymmetry that scores 0 for shape. Default 0.06 was "
-                         "measured on an untouched leggings flat; a different "
-                         "category needs its own anchor.")
+    ap.add_argument("--min-grade", "--threshold", type=float, default=62.0,
+                    metavar="GRADE",
+                    help="below this a candidate is not shippable. Default 62 is "
+                         "anchored on the only calibrated batch: the five "
+                         "candidates a human ranked as faithful re-lays scored "
+                         "63.8-74.3 and the three redrawn ones topped out at "
+                         "47.5. It is a pass mark for FIDELITY, so it is not "
+                         "comparable to the 80 the old presentation grade used.")
+    ap.add_argument("--iou-floor", type=float, default=0.70,
+                    help="silhouette IoU against the source scoring 0 (default "
+                         "0.70 - below that it is not the same outline)")
+    ap.add_argument("--iou-ceiling", type=float, default=0.95,
+                    help="silhouette IoU scoring 100 (default 0.95; 1.0 would "
+                         "mean the garment was never re-laid at all)")
+    ap.add_argument("--de-free", type=float, default=1.0,
+                    help="colour difference (dE76) still scoring 100 - below "
+                         "this it is invisible (default 1.0)")
+    ap.add_argument("--de-max", type=float, default=6.0,
+                    help="colour difference scoring 0 (default 6.0, a different "
+                         "colourway)")
+    ap.add_argument("--wrinkle-tol", type=float, default=0.35,
+                    help="how far a candidate's texture energy may sit from the "
+                         "SOURCE's own, as a fraction of it, before the term "
+                         "scores 0. Both directions: smoother than the real "
+                         "garment is a redraw, not a win (default 0.35)")
+    ap.add_argument("--sym-floor", type=float, default=0.80,
+                    help="mirror IoU scoring 0 for symmetry (default 0.80)")
+    ap.add_argument("--construction-penalty", type=float, default=15.0,
+                    metavar="POINTS",
+                    help="points off the grade per region stage 3 flagged as "
+                         "altered (default 15). Without it the grade and the "
+                         "MISMATCH label contradict each other and someone has "
+                         "to arbitrate; one run spent thirty turns doing that.")
+    ap.add_argument("--expected-changes", default="", metavar="TEXT",
+                    help="what the clean step legitimately removed, declared to "
+                         "the judges so their absence is not reported as a "
+                         "defect: --expected-changes \"pearl-headed pins "
+                         "removed\". Stored verdicts taken without it are "
+                         "re-judged, because it changes the question.")
     # The imported defaults were 0.95 -> 0 and 1.00 -> 100, which on this
     # project's own output flagged "backdrop not white" on 10 candidates out of
     # 10 and zeroed the term for 6 of them. common.py records why: the plate
@@ -639,13 +881,23 @@ def main() -> int:
                          "is still exactly one record.")
     ap.add_argument("--ship", type=int, default=0, metavar="N",
                     help="copy the top N candidates BY GRADE to <run>/output/, "
-                         "regardless of status. The grade has no construction "
-                         "term, so a pick that redrew the garment can outrank "
-                         "one that did not; every MISMATCH shipped is printed "
-                         "and logged.")
+                         "regardless of status. The grade now carries a "
+                         "construction penalty, so a flagged pick has to be "
+                         "clearly better on everything else to outrank a clean "
+                         "one - but it still can, and every MISMATCH shipped is "
+                         "printed and logged.")
+    ap.add_argument("--ship-faithful", type=int, default=0, metavar="N",
+                    help="ship N, preferring candidates stage 3 found intact: "
+                         "top N by grade among the unflagged, and only if fewer "
+                         "than N of those exist does it backfill from the "
+                         "flagged ones, printing exactly what it took and why. "
+                         "This is the one that always delivers something AND "
+                         "always says what it cost - use it instead of --ship "
+                         "unless there is a reason not to.")
     ap.add_argument("--ship-clean-only", action="store_true",
                     help="restore the gate: ship only PASS candidates, so a "
-                         "construction MISMATCH never reaches output/.")
+                         "construction MISMATCH never reaches output/. Ships "
+                         "fewer than asked, or nothing, rather than backfill.")
     ap.add_argument("--cutout", action="store_true",
                     help="also write a transparent-background *_cutout.png "
                          "beside each pick. Off by default: --ship currently "
@@ -655,6 +907,16 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--timeout", type=int, default=300)
     args = ap.parse_args()
+
+    # One number and one mode from here on, so nothing downstream has to ask
+    # which of the three flags was passed.
+    if args.ship and args.ship_faithful:
+        print("--ship and --ship-faithful both given; they select different "
+              "picks. Choose one.", file=sys.stderr)
+        return 1
+    args.deliver = args.ship or args.ship_faithful
+    args.ship_mode = ("faithful" if args.ship_faithful else
+                      "clean" if args.ship_clean_only else "grade")
 
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -693,7 +955,7 @@ def main() -> int:
     # whole run. --no-construction does NOT unblock it: skipping the check is a
     # decision to ship unchecked, and it is not one to make by accident while
     # trying to get past this message.
-    if not prof_ok and args.ship:
+    if not prof_ok and args.deliver:
         print(f"\nREFUSING TO SHIP: {prof_why}\n"
               f"  --ship writes the deliverable, and stage 3 - the only check "
               f"that can tell a re-laid garment from a redrawn one - crops by "
@@ -706,11 +968,29 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
+    # The grade is entirely measured now, so a run that only wants the grade
+    # does not need the vision server at all. Resolving the model is therefore
+    # allowed to fail when nothing is going to ask it anything - grading a batch
+    # on a laptop with the server down is a legitimate thing to do, and it used
+    # to die on line one.
+    needs_model = (not args.no_construction) or args.judge != "metrics"
     client = Client(args.base_url, args.model, args.timeout)
-    model = client.resolve_model()
-    print(f"model: {model}")
+    try:
+        model = client.resolve_model()
+        print(f"model: {model}")
+    except Exception as e:  # noqa: BLE001
+        if needs_model:
+            print(f"cannot reach the vision server at {args.base_url}: {e}\n"
+                  f"  Stage 3 needs it. --no-construction grades without it, "
+                  f"and says so in the output.", file=sys.stderr)
+            return 1
+        model = "(none - measurements only)"
+        print(f"model: {model}")
     print(f"reference:  {ref}   (the cleaned upload, not the raw input)")
     print(f"candidates: {len(cands)}   votes/candidate: {args.votes}")
+    if args.expected_changes:
+        print(f"expected:   {args.expected_changes}   <- declared to the judges "
+              f"as correct, not a defect")
     # Only reachable unresolved without --ship, which is refused above.
     prof_line = f"profile:    {prof_why}"
     if not prof_ok:
@@ -726,29 +1006,57 @@ def main() -> int:
         print(f"--rejudge: {len(cache)} stored verdict(s) will be replaced\n")
 
     # --- Stage 1 ---------------------------------------------------------
-    print("stage 1: deterministic metrics (no model)")
+    print("stage 1: measurements against the cleaned source (no model)")
     t0 = time.time()
-    ref_m = metrics(ref)
-    print(f"  reference   asym {ref_m['asymmetry']:.4f}  wrinkle "
-          f"{ref_m['wrinkle_energy']:.5f}  bg_lum {ref_m['bg_lum']:.4f}")
+    ref_m, ref_mask = measure(ref)
+    ref_box = C.garment_box(ref)["box"]
+    if not ref_m["found"]:
+        print(f"\nNO GARMENT FOUND IN THE REFERENCE ({ref}).\n"
+              f"  Every fidelity term is measured against it, so there is "
+              f"nothing to grade. Look at the image before anything else.",
+              file=sys.stderr)
+        return 1
+    print(f"  SOURCE      mask {ref_m['cue']}  {ref_m['coverage']*100:.1f}% of "
+          f"frame, aspect {ref_m['aspect']:.2f}   rgb {ref_m['rgb']}   "
+          f"wrinkle {ref_m['wrinkle_energy']:.3f}   sym {ref_m['symmetry']:.3f}   "
+          f"bg_lum {ref_m['bg_lum']:.3f}")
+    print(f"  {'':12}{'cue':<10} {'IoU':>6} {'dE':>6} {'wrinkle':>8} "
+          f"{'d-wr':>7} {'sym':>6} {'bg':>6}")
     rows = []
     for p in cands:
-        m = metrics(p)
-        rows.append({"name": p.stem, "path": p, "metrics": m,
+        m, mask = measure(p, ref_m, ref_mask)
+        g = C.garment_box(p, like=ref)
+        rows.append({"name": p.stem, "path": p, "metrics": m, "box": g["box"],
+                     "box_ok": g["ok"],
                      "_small": ensure_small(p, args.max_dim)})
-        print(f"  {p.stem:<10}  asym {m['asymmetry']:.4f}  wrinkle "
-              f"{m['wrinkle_energy']:.5f}  bg_lum {m['bg_lum']:.4f}  "
-              f"coverage {m['coverage']:.3f}")
+        print(f"  {p.stem:<12}{m['cue']:<10} {m.get('silhouette_iou', 0)*100:6.1f} "
+              f"{m.get('colour_de', 0):6.2f} {m.get('wrinkle_energy', 0):8.3f} "
+              f"{m.get('wrinkle_delta', 0):+7.3f} {m.get('symmetry', 0)*100:6.1f} "
+              f"{m.get('bg_lum', 0)*100:6.1f}")
+        if not g["ok"]:
+            print(f"  {'':12}{g['note']}")
     print(f"  done in {time.time() - t0:.1f}s")
 
+    # Two batch-relative context columns, printed but no longer scored. They
+    # answer "which of these is smoothest" - a question the grade deliberately
+    # stopped asking, because the answer is usually the redraw.
     sym_n = normalise([r["metrics"]["asymmetry"] for r in rows], True)
     wr_n = normalise([r["metrics"]["wrinkle_energy"] for r in rows], True)
     for r, s, w in zip(rows, sym_n, wr_n):
         r["sym_rank"], r["wr_rank"] = s, w
 
-    # --- Stage 2 ---------------------------------------------------------
+    # --- Stage 2, advisory -------------------------------------------------
+    # Nothing below feeds the grade. Both model modes were measured on this
+    # project and both failed in ways that cannot be corrected for: the
+    # tournament picked by slot 100% of the time, and the rubric returned
+    # 100/100 for every candidate across 12 calls including one with a visibly
+    # grey backdrop. They are kept because re-testing them on a better model
+    # should cost one flag, not a rewrite.
     ref_small = ensure_small(ref, args.max_dim)
     tour = {"position_picks": {}, "bouts": []}
+    for r in rows:
+        r["shape"] = r["wrinkles"] = 0.0
+        r["bouts"] = 0
 
     if args.judge == "tournament":
         n_pairs = len(rows) * (len(rows) - 1)
@@ -773,11 +1081,12 @@ def main() -> int:
             print("  WARNING: the judge is picking by slot, not by image. These "
                   "win-rates are noise; prefer --judge metrics.")
     elif args.judge == "absolute":
-        print(f"\nstage 2: absolute rubric grading, {args.votes} votes each")
+        print(f"\nstage 2: absolute rubric grading, {args.votes} votes each "
+              f"(advisory - does not feed the grade)")
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             futs = {pool.submit(grade_voted, client, ref_small, r["_small"],
-                                args.votes): r for r in rows}
+                                args.votes, args.expected_changes): r for r in rows}
             for fut in concurrent.futures.as_completed(futs):
                 r = futs[fut]
                 try:
@@ -789,6 +1098,7 @@ def main() -> int:
                 r["shape"], r["wrinkles"] = g["shape"], g["wrinkles"]
                 r["bouts"] = g["votes_counted"]
                 r["grade_detail"] = g
+                r["vision"] = {k: g[k] for k in ("shape", "wrinkles", "verdict")}
                 print(f"  {r['name']:<10}  shape {g['shape']:5.1f} "
                       f"(spread {g['shape_spread']:4.1f})   wrinkles {g['wrinkles']:5.1f} "
                       f"(spread {g['wrinkle_spread']:4.1f})   {g['verdict']}")
@@ -797,40 +1107,38 @@ def main() -> int:
             print("  WARNING: every candidate scored ~100 on both axes. The rubric "
                   "has saturated and cannot rank; prefer --judge metrics.")
     else:
-        print("\nstage 2: scoring shape and wrinkles from the measurements")
-        # Shape anchors on the reference: an untouched real flat measured 0.06
-        # asymmetry, so that is the zero mark and a perfectly mirrored garment
-        # is 100.
-        for r in rows:
-            a = r["metrics"]["asymmetry"]
-            r["shape"] = round(max(0.0, min(100.0,
-                                            (1 - a / args.asym_anchor) * 100)), 1)
-        # Wrinkle energy spans only ~7% across this batch, too narrow for an
-        # absolute scale, so it is ranked within the batch and labelled as such.
-        for r, w in zip(rows, normalise([r["metrics"]["wrinkle_energy"] for r in rows],
-                                        True)):
-            r["wrinkles"] = w
-        for r in rows:
-            r["bouts"] = 0
-            print(f"  {r['name']:<10}  shape {r['shape']:5.1f} (asym "
-                  f"{r['metrics']['asymmetry']:.4f})   wrinkles {r['wrinkles']:5.1f} "
-                  f"(energy {r['metrics']['wrinkle_energy']:.5f}, batch-relative)")
+        print("\nstage 2: skipped - the grade is measured, and no vision judge "
+              "here beat the measurements. --judge absolute | tournament runs "
+              "one anyway, beside the grade.")
 
     # --- Stage 3 ---------------------------------------------------------
     regions = REGIONS_BY_PROFILE[profile]
     n_reused = 0
+    ref_face = {}
     if not args.no_construction:
         print(f"\nstage 3: construction integrity on native-res crops, "
               f"{profile} regions ({', '.join(regions)})")
+        ref_face = face_of(client, ref_small)
+        print(f"  orientation: the source reads {ref_face['side']} / "
+              f"{ref_face['face']} - {ref_face['why'][:80]}")
+        if "CANNOT TELL" in (ref_face["side"], ref_face["face"]):
+            print("  the source's own face could not be read, so no candidate "
+                  "can be compared against it; orientation is not checked.")
         t0 = time.time()
         n_judged = 0
+        if args.expected_changes:
+            print(f"  declared as expected, not defects: {args.expected_changes}")
         for r in rows:
-            fp = fingerprint(r["path"], ref, profile, regions)
+            fp = fingerprint(r["path"], ref, profile, regions,
+                             args.expected_changes)
             hit = cache.get(r["name"]) or {}
             fresh = args.rejudge or any(hit.get(k) != v for k, v in fp.items())
             if fresh:
                 transient(f"  {r['name']:<10}  judging ...")
-                r["construction"] = check_construction(client, ref, r["path"], regions)
+                r["construction"] = check_construction(
+                    client, ref, r["path"], regions, ref_box, r["box"],
+                    args.expected_changes)
+                r["face"] = face_verdict(ref_face, face_of(client, r["_small"]))
                 stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
                 r["construction_from"] = f"judged {stamp[11:]}"
                 n_judged += 1
@@ -839,23 +1147,27 @@ def main() -> int:
                 # into the record and never ask again.
                 if not any(c.get("verdict") == "ERROR" for c in r["construction"]):
                     cache[r["name"]] = {**fp, "judged_at": stamp, "model": model,
-                                        "verdicts": r["construction"]}
+                                        "verdicts": r["construction"],
+                                        "face": r["face"]}
                 else:
                     cache.pop(r["name"], None)
             else:
                 r["construction"] = hit["verdicts"]
+                r["face"] = hit.get("face") or {}
                 r["construction_from"] = f"cached {hit.get('judged_at', '')[11:]}"
                 n_reused += 1
 
             note = (f"   ({r['construction_from']})" if not fresh else "")
             bad = [c for c in r["construction"] if c.get("verdict") == "MISMATCH"]
-            if bad:
-                settled(f"  {r['name']:<10}  MISMATCH in "
-                        f"{', '.join(c['region'] for c in bad)}{note}")
-                for c in bad:
-                    print(f"                -> {c['region']}: {c.get('detail','')}")
-            else:
-                settled(f"  {r['name']:<10}  all regions match{note}")
+            flip = flipped(r)
+            head = ", ".join(filter(None, [
+                f"MISMATCH in {', '.join(c['region'] for c in bad)}" if bad else "",
+                "FLIPPED - shows the other face" if flip else ""]))
+            settled(f"  {r['name']:<10}  {head or 'all regions match'}{note}")
+            for c in bad:
+                print(f"                -> {c['region']}: {c.get('detail','')}")
+            if flip:
+                print(f"                -> face: {flip.get('differs','')}")
         # The same images judged twice give two different answers - this model
         # scored one candidate 100 then 60 on a rescale alone - so a second pass
         # over the same batch reuses the first pass's verdict instead of rolling
@@ -887,59 +1199,96 @@ def main() -> int:
             if not prof_ok:
                 print("    the profile was ASSUMED, not read. That is the first "
                       "thing to rule out.")
-    else:
+
+        n_flip = sum(1 for r in rows if flipped(r))
+        if n_flip:
+            print(f"\n  {n_flip} of {len(rows)} candidates show the OTHER FACE of "
+                  f"the garment. That is a prompt fault, not a draw-by-draw one: "
+                  f"check archive/prompt.txt for anything naming a side, and the "
+                  f"lay reference for whether it shows the face the product does "
+                  f"not.")
         for r in rows:
             r["construction"] = []
 
     # --- Combine ---------------------------------------------------------
     for r in rows:
-        # Background is scored from the measurement, not the model: the model
-        # rated a visibly grey backdrop 100/100.
-        span = max(args.bg_white - args.bg_floor, 1e-6)
-        bg = max(0.0, min(100.0,
-                          (r["metrics"]["bg_lum"] - args.bg_floor) / span * 100))
-        r["background"] = round(bg, 1)
-        grade = 0.45 * r["shape"] + 0.45 * r["wrinkles"] + 0.10 * bg
+        t = score_row(r["metrics"], args, ref_m["wrinkle_energy"])
+        r["terms"] = t
+        r["background"] = t["background"]
+        base = sum(WEIGHTS[k] * t[k] for k in WEIGHTS)
         notes = []
         if r["metrics"]["bg_lum"] < args.bg_floor:
             notes.append(f"backdrop not a plate (bg_lum {r['metrics']['bg_lum']:.3f} "
                          f"< {args.bg_floor:.2f})")
+        if not r["box_ok"]:
+            notes.append("garment box not credible; measured on a fallback")
         mism = [c for c in r.get("construction", []) if c.get("verdict") == "MISMATCH"]
-        # Construction failure is disqualifying, not a deduction: a candidate that
-        # redrew the garment is the wrong product however good it looks.
+        flip = flipped(r)
+
+        # Construction failure costs points AND disqualifies. The penalty is not
+        # a softening of the gate: it exists so the ranking cannot say one thing
+        # while the status says another, which is what sent a run into thirty
+        # turns of arbitration between a 79.1 grade and three MISMATCH flags on
+        # the same image.
+        #
+        # A flip costs the same as one altered region and disqualifies the same
+        # way. It is arguably worse than any single seam - it is the wrong side
+        # of the product - but it is one fault, and pricing it as one keeps the
+        # arithmetic something a reader can check.
+        r["flipped"] = bool(flip)
+        r["penalty"] = round(args.construction_penalty * (len(mism) + bool(flip)), 1)
+        grade = base - r["penalty"]
+        if flip:
+            notes.append(f"FLIPPED (-{args.construction_penalty:.0f}): "
+                         f"{flip.get('differs', '')}")
         if mism:
-            r["status"] = "REJECT"
-            notes.append("construction altered: " +
+            notes.append(f"construction altered ({len(mism)} region(s), "
+                         f"-{args.construction_penalty * len(mism):.0f}): " +
                          "; ".join(f"{c['region']} - {c.get('detail','')}" for c in mism))
+        # One chain, so nothing can set a status and have a later branch quietly
+        # set it back. A flip disqualifies exactly as an altered region does: it
+        # is the wrong side of the product, whatever the grade says.
+        if mism or flip:
+            r["status"] = "REJECT"
         elif grade >= args.min_grade:
             r["status"] = "PASS"
         else:
             r["status"] = "BELOW"
             notes.append(f"grade {grade:.1f} < {args.min_grade:.0f}")
+        r["base"] = round(max(0.0, min(100.0, base)), 1)
         r["grade"] = round(max(0.0, min(100.0, grade)), 1)
         r["notes"] = notes
 
     rows.sort(key=lambda r: (r["status"] == "REJECT", -r["grade"]))
 
-    print(f"\nRANKING  (grade = 45% shape + 45% wrinkles + 10% background, "
+    formula = " + ".join(f"{int(w*100)}% {k}" for k, w in WEIGHTS.items())
+    print(f"\nRANKING  (grade = {formula}, "
+          f"-{args.construction_penalty:.0f}/altered region, "
           f"pass mark {args.min_grade:.0f})")
-    print(f"  {'':3} {'grade':>6} {'status':<7} {'name':<10} {'shape':>6} {'wrink':>6} "
-          f"{'bg':>5} {'sym*':>5} {'smooth*':>7}  notes")
+    print(f"  {'':3} {'grade':>6} {'status':<7} {'name':<10} {'silh':>6} {'col':>6} "
+          f"{'wrink':>6} {'sym':>5} {'bg':>5} {'pen':>5} {'sym*':>5} {'smooth*':>7}"
+          f"  notes")
     for i, r in enumerate(rows, start=1):
+        t = r["terms"]
         print(f"  {i:>2}. {r['grade']:6.1f} {r['status']:<7} {r['name']:<10} "
-              f"{r['shape']:6.1f} {r['wrinkles']:6.1f} {r['background']:5.0f} "
+              f"{t['silhouette']:6.1f} {t['colour']:6.1f} {t['wrinkle']:6.1f} "
+              f"{t['symmetry']:5.0f} {t['background']:5.0f} "
+              f"{-r['penalty'] if r['penalty'] else 0:5.0f} "
               f"{r['sym_rank']:5.0f} {r['wr_rank']:7.0f}  "
-              f"{'; '.join(r['notes'])[:60]}")
-    print("  shape/wrink are " + ("tournament win-rates" if args.judge == "tournament"
-                                  else "measured: shape absolute, wrinkles batch-relative")
-          + "; bg is measured")
-    print("  * sym / smooth are deterministic, ranked within this batch only")
+              f"{'; '.join(r['notes'])[:52]}")
+    print("  silh / col / wrink are measured AGAINST THE SOURCE: outline IoU, "
+          "colour dE, texture distance")
+    print("  * sym / smooth are batch-relative context, not scored - 100 means "
+          "'most of these', not 'good'")
+    if args.judge != "metrics":
+        print(f"  the {args.judge} judge ran but does not feed the grade; its "
+              f"numbers are above, in stage 2")
     least = min(rows, key=lambda r: len([c for c in r.get("construction", [])
                                          if c.get("verdict") == "MISMATCH"]))
     n_bad = len([c for c in least.get("construction", []) if c.get("verdict") == "MISMATCH"])
     if any(r["status"] == "REJECT" for r in rows):
-        print(f"\n  least-altered candidate: {least['name']} ({n_bad} region(s) changed)."
-              f"  Presentation rank was #{rows.index(least) + 1}.")
+        print(f"\n  least-altered candidate: {least['name']} ({n_bad} region(s) "
+              f"changed).  Rank #{rows.index(least) + 1} of {len(rows)}.")
 
     winners = [r for r in rows if r["status"] == "PASS"]
     sheet = build_sheet(ref_small, rows, arch / "grade_results.jpg")
@@ -963,13 +1312,26 @@ def main() -> int:
     print()
     if winners:
         b = winners[0]
+        t = b["terms"]
         print(f"BEST: {b['name']}  grade {b['grade']:.1f}  "
-              f"(shape {b['shape']:.0f}, wrinkles {b['wrinkles']:.0f})")
+              f"(silhouette {t['silhouette']:.0f}, colour {t['colour']:.0f}, "
+              f"wrinkle {t['wrinkle']:.0f})")
         print(f"KEEP  {','.join(r['name'] for r in winners)}"
               f"  <- only these are eligible for --ship")
     else:
+        best = rows[0] if rows else None
         print(f"NO SHIPPABLE CANDIDATE - nothing cleared {args.min_grade:.0f} "
               f"with construction intact")
+        if best is not None:
+            print(f"  closest was {best['name']} at {best['grade']:.1f}"
+                  + (f" ({best['base']:.1f} before -{best['penalty']:.0f} for "
+                     f"construction)" if best["penalty"] else ""))
+            if all(r["penalty"] for r in rows) and not args.expected_changes:
+                print("  EVERY candidate lost points to construction flags. If "
+                      "the clean step left something behind - a pin, a clip, a "
+                      "tag - every candidate correctly dropping it reads as ten "
+                      "identical defects. Declare it: "
+                      "--expected-changes \"...\" (and see the WARNING above).")
     print(f"wrote {arch / 'grade_results.json'}")
     print(f"wrote {mp}   <- per-candidate verdicts, incl. construction")
     print(f"wrote {sheet}")
@@ -978,27 +1340,84 @@ def main() -> int:
                        ", no construction check")
                     + (f" ({n_reused} verdict(s) reused)" if n_reused else ""))
 
-    if args.ship:
+    if args.deliver:
         return ship(args, winners, rows)
     return 0 if winners else 2
 
 
+def mismatched(r: dict) -> list[dict]:
+    return [c for c in r.get("construction", []) if c.get("verdict") == "MISMATCH"]
+
+
+def choose_picks(args, winners: list[dict], rows: list[dict]) -> tuple[list[dict], str, list[str]]:
+    """Which candidates ship, under whichever of the three modes was asked for.
+
+    Returns (picks, basis, notes). The notes are the whole point of the
+    `faithful` mode: a delivery that quietly swapped a flagged image in for a
+    missing clean one looks exactly like a delivery that had four clean ones,
+    and the difference is the entire content of `## Picking`.
+    """
+    by_grade = sorted(rows, key=lambda r: -r["grade"])
+    n = args.deliver
+    if args.ship_mode == "clean":
+        return winners[:n], "PASS only", []
+    if args.ship_mode == "grade":
+        # rows is sorted with REJECTs last; re-sort on grade alone so status
+        # plays no part in who ships.
+        return by_grade[:n], "top by grade", []
+
+    clean = [r for r in by_grade if not mismatched(r)]
+    picks, notes = clean[:n], []
+    if len(picks) < n:
+        # Deliberate, and deliberately loud. A batch where the construction
+        # check flagged everything is a real outcome - it happened on a real
+        # run, ten for ten - and shipping nothing leaves the images paid for
+        # and undelivered. Backfilling by grade at least ships the best of a
+        # bad batch, with the cost of each one named on its own line.
+        short = n - len(picks)
+        backfill = [r for r in by_grade if mismatched(r)][:short]
+        notes.append(f"only {len(picks)} of {n} candidates came through stage 3 "
+                     f"intact; backfilling {len(backfill)} by grade")
+        for r in backfill:
+            notes.append(f"  {r['name']} carries {len(mismatched(r))} altered "
+                         f"region(s): "
+                         f"{', '.join(c['region'] for c in mismatched(r))}")
+        picks = picks + backfill
+    excluded = [r for r in by_grade if mismatched(r) and r not in picks]
+    if excluded:
+        notes.append("held back for altered construction, best first: "
+                     + ", ".join(f"{r['name']} ({r['grade']:.1f}, "
+                                 f"{len(mismatched(r))} region(s))"
+                                 for r in excluded[:4]))
+    return picks, "faithful first, then by grade", notes
+
+
 def ship(args, winners: list[dict], rows: list[dict]) -> int:
-    """Copy the top --ship candidates by grade to output/.
+    """Copy the picks to output/.
 
-    Selection ignores status by default: the top N by grade ship whether or not
-    stage 3 found altered construction. That is a deliberate operator decision,
-    taken because a whole batch failing the gate left output/ empty and the run
-    with nothing to show for ten paid-for images.
+    Three modes, and which one a run uses is the whole of its delivery policy:
 
-    What that costs, so it is not rediscovered later: the grade is 45% shape +
-    45% wrinkles + 10% background and contains no construction term at all, so
-    ranking by it says nothing about whether the garment was redrawn. A
-    candidate that invented a seam can and does outrank one that did not - on
-    the batch this was built for, the top-graded image had three altered
-    regions and the least-altered was ranked sixth. Every MISMATCH is therefore
-    printed per pick and written to steps.log, so a shipped defect is recorded
-    rather than merely allowed.
+      --ship N            top N by grade, status ignored.
+      --ship-faithful N   top N among the candidates stage 3 found intact,
+                          backfilled by grade only if there are fewer than N,
+                          with every exclusion and every backfill printed.
+      --ship-clean-only   PASS only, ships fewer rather than backfill.
+
+    `faithful` exists because the other two are the two ways a run goes wrong.
+    Ranking by grade alone shipped a redrawn garment at the top of a real
+    batch; gating on PASS left output/ empty on another and the run with
+    nothing to show for ten paid-for images. Neither needed a judgement call -
+    they needed a rule that prefers the intact ones and says out loud when it
+    could not find enough.
+
+    What that costs, so it is not rediscovered later: the grade now carries
+    -15 per altered region, so the ranking no longer contradicts the flags the
+    way it did when the top-graded image of a real batch had three altered
+    regions and the least-altered one ranked sixth. It is still a penalty and
+    not a veto: a heavily flagged candidate that is otherwise excellent can
+    outrank a clean mediocre one. Every MISMATCH is therefore printed per pick
+    and written to steps.log, so a shipped defect is recorded rather than
+    merely allowed.
 
     --ship-clean-only restores the gate.
 
@@ -1013,16 +1432,11 @@ def ship(args, winners: list[dict], rows: list[dict]) -> int:
     outd = args.run / "output"
     arch = args.run / "archive"
 
-    if args.ship_clean_only:
-        pool, basis = winners, "PASS only"
-    else:
-        # rows is sorted with REJECTs last; re-sort on grade alone so status
-        # plays no part in who ships.
-        pool, basis = sorted(rows, key=lambda r: -r["grade"]), "top by grade"
-    picks = pool[:args.ship]
+    picks, basis, why = choose_picks(args, winners, rows)
+    flag = "--ship-faithful" if args.ship_mode == "faithful" else "--ship"
     if not picks:
-        print(f"\n--ship {args.ship}: nothing to ship "
-              f"({'the KEEP list is empty' if args.ship_clean_only else 'no candidates'}).")
+        print(f"\n{flag} {args.deliver}: nothing to ship "
+              f"({'the KEEP list is empty' if args.ship_mode == 'clean' else 'no candidates'}).")
         return 2
 
     outd.mkdir(parents=True, exist_ok=True)
@@ -1033,8 +1447,10 @@ def ship(args, winners: list[dict], rows: list[dict]) -> int:
     for old in sorted(outd.glob("pick*.png")):      # includes _cutout.png
         old.unlink()
 
-    print(f"\n--ship {args.ship}: writing {len(picks)} pick(s) to {outd}  ({basis})"
-          + ("" if args.cutout else "  (flats only, no cutouts)"))
+    print(f"\n{flag} {args.deliver}: writing {len(picks)} pick(s) to {outd}  "
+          f"({basis})" + ("" if args.cutout else "  (flats only, no cutouts)"))
+    for line in why:
+        print(f"  {line}")
     shipped_bad = []
     for rank, r in enumerate(picks, 1):
         src = arch / f"{r['name']}.png"
@@ -1077,13 +1493,13 @@ def ship(args, winners: list[dict], rows: list[dict]) -> int:
         except Exception as e:  # noqa: BLE001 - a failed cutout must not lose the pick
             print(f"  {'  -> ' + co.name:32} FAILED: {e}")
 
-    short = len(picks) < args.ship
+    short = len(picks) < args.deliver
     if short:
         rest = [r for r in rows if r not in picks]
-        print(f"\nONLY {len(picks)} OF {args.ship} SHIPPED. "
+        print(f"\nONLY {len(picks)} OF {args.deliver} SHIPPED. "
               f"{len(rest)} more are already generated and paid for.")
         print("Next best, in order - each with what it would cost you:")
-        for r in rest[:max(args.ship - len(picks) + 2, 4)]:
+        for r in rest[:max(args.deliver - len(picks) + 2, 4)]:
             # "grade N < mark" is already the note for a BELOW, so naming the
             # column "grade" too prints the number twice on the same line.
             why = [n for n in r["notes"] if not n.startswith("grade ")]
@@ -1104,7 +1520,8 @@ def ship(args, winners: list[dict], rows: list[dict]) -> int:
               f"`## Notes` which picks carry this - the grade does not, and "
               f"output/ on its own cannot tell anyone.")
 
-    flags = "".join([" (no cutouts)" if not args.cutout else "",
+    flags = "".join([f" [{args.ship_mode}]",
+                     " (no cutouts)" if not args.cutout else "",
                      f" ({len(shipped_bad)} with altered construction)"
                      if shipped_bad else ""])
     C.log(args.run, f"shipped {len(picks)}{flags}: "

@@ -18,6 +18,7 @@ archive/prompt.txt itself.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -88,15 +89,27 @@ right.
    from image 1 - a different number of straps, closures or panels - ignore all
    of that. The output has exactly the parts visible in image 1, no more and no
    fewer.
+
+{bleed_note}
 4. **The lay itself - this is the actual job.** Name what is untidy in image 1
    and what square looks like for THIS garment: legs parallel and closed rather
    than splayed, straps flat and symmetric, hems level, no twists or folds.
 5. **Flatness.** It stays laid flat as in image 1. No volume, body, 3D shaping,
    draping or a worn look. The model adds volume unless told not to.
-6. **Wrinkle-free, always.** The garment must read as freshly steamed and
-   pressed - no creases, no rumples, no fold lines, no puckering, no shadows
-   cast by folds. Say this explicitly every time; it does not happen by
-   default.
+6. **Relax the creases - do not iron the fabric out of existence.** Ask for
+   this, in your own words: **relax the handling folds and creases so the
+   fabric lies flat; keep the knit's real texture - do not iron it into a
+   smooth painted surface.**
+
+   Say it that way round. The maximal version - "completely wrinkle-free, as if
+   freshly steamed and pressed, no creases, no rumples, no fold lines" - is
+   what a real prompt asked for, and it is this project's documented driver of
+   redraws: told to remove every trace of texture, the model repaints the
+   panel. The grade now measures the consequence directly. `wrink` scores the
+   DISTANCE between the candidate's surface texture and the source's, in both
+   directions, so a candidate ironed smoother than the real garment loses
+   exactly as much as a creased one. `generate.py` warns when it sees the
+   absolutes.
 
    Be precise about what stays, or the model smooths the product away with the
    creases: **seams, topstitching, panel lines, pockets, elastic edges, the
@@ -125,6 +138,26 @@ right.
 9. **Nothing cropped.** The whole garment stays inside the frame with clear space
    on every side. This is the one framing fault that matters: a clipped hem or
    strap tip cannot be retouched back.
+10. **Square, as its own clause.** Do not leave this tangled into the wrinkle
+    sentence - it is a different instruction and it gets lost. Say: **lay the
+    garment straight and square: band parallel to the bottom of the frame,
+    straps arranged symmetrically, no rotation or tilt, the whole garment
+    inside the frame with white space around it.**
+
+    That is about the GARMENT'S OWN alignment. Do not extend it into centring,
+    margins or scale - placement is deliberately ungraded here, the retouch team
+    sets it, and clauses about framing make the model repaint a product that was
+    already right. The `sym` term rewards a square lay at 15% of the grade,
+    which is as much weight as it should carry: a redrawn garment is always more
+    symmetric than a real one, so symmetry cannot be allowed to outrank
+    fidelity.
+11. **The same face of the garment.** Never state or imply which side is showing
+    - not "shown from the back", not "the front view", not "reverse side".
+    `generate.py` REFUSES a prompt that names a viewpoint, because that is
+    exactly how a garment comes back flipped: one run's prompt opened "the
+    garment is shown from the back" and four of its ten candidates came back
+    showing the other face. The clause that keeps the face correct is appended
+    to every prompt automatically; yours does not need to mention sides at all.
 
 ## Inputs as measured
 
@@ -243,10 +276,32 @@ def main() -> int:
         if not desc.exists():
             print("  no construction inventory; prompts will not carry one.")
 
+    # Step 0 measured what the reference carries beyond the lay. That is worth
+    # a clause of the agent's own prompt as well as the one generate.py appends
+    # automatically - the two say the same thing, and the failure they describe
+    # cost four of ten images on a real run.
+    bleed_note = ""
+    try:
+        sel = json.loads((run / "reference_selection.json").read_text())
+        risk = sel.get("construction_risk") or {}
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        risk = {}
+    if risk.get("flagged"):
+        bleed_note = (
+            f"   **Step 0 measured this reference as differing from the product "
+            f"in: {', '.join(risk.get('terms', []))}.** It reported: "
+            f"\"{risk.get('line', '')}\" None of that is on the garment in image "
+            f"1. Say so explicitly in your own words - `generate.py` appends a "
+            f"clause about it too, and this is the failure that put a neckline "
+            f"seam and strap topstitching on four of ten candidates in a real "
+            f"run.")
+        print(f"  reference bleed risk: {', '.join(risk.get('terms', []))} - "
+              f"the brief carries a clause about it")
+
     (run / "archive" / "prompt_brief.md").write_text(
         BRIEF.format(run=run, ref_note=note, off=off_desc, ref=ref_desc,
-                    ref_path=a.reference))
-    print("brief        archive/prompt_brief.md - 9 clauses the prompt must cover")
+                    ref_path=a.reference, bleed_note=bleed_note))
+    print("brief        archive/prompt_brief.md - 11 clauses the prompt must cover")
     print("NO prompt written. Look at both images, then write archive/prompt.txt.")
 
     w, h = Image.open(up_path).size

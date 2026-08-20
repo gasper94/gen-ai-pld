@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 
 import common as C
@@ -83,16 +82,19 @@ REGIONS_BY_PROFILE = {
 }
 
 
-def bbox(path: Path) -> tuple[int, int, int, int]:
-    """Garment bounding box in the image's own full-resolution pixels."""
-    m, _ = C.garment_mask(path)
-    W, H = Image.open(path).size
-    ys, xs = np.nonzero(m)
-    if not len(xs):
+def bbox(path: Path, like: Path | None = None) -> tuple[tuple[int, int, int, int], str, bool]:
+    """Garment bounding box in the image's own full-resolution pixels.
+
+    `like` is the other side of the pair - the cleaned source - and turns on the
+    credibility check in common.garment_box. A region is a FRACTION of this box,
+    so a box that is wrong by 10x does not produce a slightly wrong crop, it
+    produces a confident close-up of a different part of the garment, which is
+    the exact failure this whole file exists to prevent.
+    """
+    g = C.garment_box(path, like=like)
+    if g["box"] is None:
         raise SystemExit(f"No garment found in {path}")
-    sx, sy = W / m.shape[1], H / m.shape[0]
-    return (int(xs.min() * sx), int(ys.min() * sy),
-            int(xs.max() * sx), int(ys.max() * sy))
+    return g["box"], g["note"], g["ok"]
 
 
 def main() -> int:
@@ -188,12 +190,16 @@ def main() -> int:
                          f"{hint}") or 1
 
     boxes = {}
-    for label, p in (("a", a_path), ("b", b_path)):
-        x0, y0, x1, y1 = bbox(p)
+    # Image A is the reference the check is made against, so it is measured on
+    # its own; image B is checked against it.
+    for label, p, like in (("a", a_path, None), ("b", b_path, a_path)):
+        (x0, y0, x1, y1), note, ok = bbox(p, like=like)
         gw, gh = x1 - x0, y1 - y0
         boxes[label] = [x0 + u0 * gw, y0 + v0 * gh, (u1 - u0) * gw, (v1 - v0) * gh]
         print(f"  {p.name:22} {Image.open(p).size[0]}x{Image.open(p).size[1]}  "
               f"garment {gw}x{gh} at ({x0},{y0})")
+        if not ok:
+            print(f"  {'':22} {note}")
 
     # Both crops must stay under max_px or the vision call resamples them and the
     # comparison is no longer 1:1. Shrink both by the SAME normalised factor, so

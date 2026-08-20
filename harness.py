@@ -97,6 +97,13 @@ BASH_TIMEOUT = 900
 # breakage, 2 is the entrypoint's own usage errors, 3 is a short delivery.
 EXIT_NO_REFERENCE = 20
 
+# "The pre-clean gate rejected the source" is the same kind of answer: the
+# pipeline worked, and what it produced is a refusal to spend money on a garment
+# it can prove was damaged before generation. Distinct from 20 because the fix
+# is different - one needs a hero uploaded, the other needs the input photo or
+# the eraser looked at.
+EXIT_UNCLEAN_SOURCE = 21
+
 # Tools that only observe. These never prompt for approval.
 READONLY_TOOLS = {"read_file", "view_image", "compare_images", "finish"}
 
@@ -1114,12 +1121,42 @@ class Session:
                 for m in self.messages]
 
     # -- main loop ---------------------------------------------------------
+    def delivered(self) -> bool:
+        """Is there anything in output/ yet."""
+        return any((self.run_dir / "output").glob("pick*.png"))
+
     def run(self) -> dict:
         result = {"status": "max_iters", "summary": "Hit the iteration cap."}
+        warned_late = False
 
         for i in range(1, self.max_iters + 1):
             if self.prompt_tokens > self.compact_at:
                 self.compact()
+
+            # Three turns out, with nothing delivered, the run is told plainly
+            # that it is nearly over. A real run spent its last thirty turns
+            # appealing construction flags image by image and reached the cap
+            # with an empty output/ and ten paid-for images in archive/. It did
+            # not run out of information; it ran out of turns while deciding.
+            left = self.max_iters - i + 1
+            if left <= 3 and not warned_late and not self.delivered():
+                warned_late = True
+                TR.warn("session", "delivery warning injected", turns_left=left)
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"{left} turn(s) left before the run is cut off, and "
+                        f"output/ is still empty. Stop investigating and "
+                        f"deliver now:\n"
+                        f"  cd {self.ws}/tools && {self.tools.python} "
+                        f"grade_flats.py --run {self.run_dir} --ship-faithful 4\n"
+                        f"then write LOG.md and call finish(). It ships the "
+                        f"most faithful candidates first and prints exactly "
+                        f"what each one carries, so an imperfect batch is "
+                        f"still a delivery with its costs named. Shipping four "
+                        f"flagged images with the flags written down beats "
+                        f"shipping nothing."),
+                })
 
             TR.rule(f"turn {i}/{self.max_iters}")
             TR.info("turn", "calling the model", messages=len(self.messages),
@@ -1382,14 +1419,15 @@ def pre_clean(workspace: Path, run_dir: Path, python: str) -> Path | None:
     here now and prepare.py verifies the result instead of redoing it, so there
     is one cleaning path and the total spend is unchanged.
 
-    Returns the cleaned image, or None if cleaning did not produce one. None is
-    survivable: the caller falls back to the raw input and says so.
+    Returns (cleaned image or None, gate failures). None is survivable: the
+    caller falls back to the raw input and says so. A non-empty failure list is
+    NOT survivable and parks the run - see the caller.
     """
     script = workspace / "tools" / "clean.py"
     out = run_dir / "archive" / "offset_upload.jpg"
     if not script.exists():
         TR.warn("step0", f"no {script}; matching against the raw input")
-        return None
+        return None, []
     print(c(BOLD, "\nstep 0a · pre-clean") +
           c(DIM, "  (so the reference is matched against the clean image)"),
           flush=True)
@@ -1399,12 +1437,82 @@ def pre_clean(workspace: Path, run_dir: Path, python: str) -> Path | None:
                                cwd=script.parent, comp="step0")
     if rc == 0 and out.exists():
         TR.info("step0", "pre-clean ok", out=str(out))
-        return out
+        return out, []
+
+    # Which kind of failure this is decides whether the run may continue, so
+    # read the audit rather than the exit code alone. A gate failure means the
+    # cleaned image is not the same garment as the photograph; anything else
+    # (no key, no network, a crash) leaves the raw input usable.
+    fails = []
+    audit = run_dir / "archive" / "clean_audit.json"
+    if audit.exists():
+        try:
+            attempts = json.loads(audit.read_text()).get("attempts") or []
+            fails = list((attempts[-1] if attempts else {}).get("outline_fails") or [])
+        except (json.JSONDecodeError, OSError):
+            fails = []
+    if fails:
+        TR.error("step0", "pre-clean gate failed", exit_code=rc, fails=fails)
+        return (out if out.exists() else None), fails
     TR.warn("step0", "pre-clean failed; matching against the raw input",
             exit_code=rc, out_exists=out.exists())
     print(c(YEL, f"  pre-clean failed (exit {rc}); the reference will be "
                  f"matched against the raw input."))
-    return None
+    return None, []
+
+
+def force_ship(workspace: Path, run_dir: Path, python: str, n: int) -> bool:
+    """Deliver from what is already generated, when the agent did not.
+
+    The backstop for the failure this harness has actually produced: a run that
+    reached its iteration cap with ten paid-for images in archive/ and nothing
+    in output/. Every one of those images was billed, graded and then
+    abandoned, because the last turn arrived while the agent was still
+    arbitrating between a grade and a flag.
+
+    Nothing here is a judgement call. grade_flats.py --ship-faithful picks the
+    candidates stage 3 found intact, backfills by grade only if there are too
+    few, and prints what each pick carries. If the agent already shipped, this
+    does nothing at all.
+
+    The expected-changes declaration is carried over from the agent's own last
+    grading pass, so the forced delivery reproduces the judgement the run
+    already made rather than taking a fresh and different one.
+    """
+    outd, arch = run_dir / "output", run_dir / "archive"
+    if any(outd.glob("pick*.png")):
+        return False
+    if not list(arch.glob("cand_*.png")):
+        return False
+    script = workspace / "tools" / "grade_flats.py"
+    if not script.exists():
+        return False
+
+    expected = ""
+    try:
+        expected = str(json.loads((arch / "metrics.json").read_text())
+                       .get("expected_changes") or "")
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        expected = ""
+
+    cmd = [python, str(script), "--run", str(run_dir), "--ship-faithful", str(n)]
+    if expected:
+        cmd += ["--expected-changes", expected]
+    print(c(YEL, f"\nthe run ended without delivering, and "
+                 f"{len(list(arch.glob('cand_*.png')))} generated image(s) are "
+                 f"sitting in archive/."))
+    print(c(DIM, f"  shipping the {n} most faithful of them, deterministically. "
+                 f"This is the harness, not the agent."))
+    TR.warn("harness", "forcing delivery after an undelivered run",
+            n=n, expected_changes=expected or None)
+    with TR.console_component("ship"):
+        rc = stream_subprocess(cmd, cwd=script.parent, comp="ship")
+    shipped = any(outd.glob("pick*.png"))
+    TR.info("harness", "forced delivery finished", exit_code=rc, shipped=shipped)
+    if not shipped:
+        print(c(RED, "  nothing shipped - read the output above; output/ is "
+                     "still empty."))
+    return shipped
 
 
 def select_reference(workspace: Path, run_dir: Path, python: str,
@@ -1480,6 +1588,20 @@ def main():
                          "the reference. The match is then made against the raw "
                          "input, tag and room included, and prepare.py cleans "
                          "on the agent's first turn as it used to.")
+    ap.add_argument("--ship-on-cap", type=int, default=4, metavar="N",
+                    help="If the run ends with output/ empty and generated "
+                         "images in archive/, the harness ships the N most "
+                         "faithful of them itself (grade_flats.py "
+                         "--ship-faithful N) rather than abandoning paid-for "
+                         "images. 0 turns it off. The agent is also warned "
+                         "three turns before the cap.")
+    ap.add_argument("--allow-dirty-source", action="store_true",
+                    help=f"Start the agent even when the pre-clean OUTLINE GATE "
+                         f"failed - that is, when the cleaned image is missing "
+                         f"part of the garment. Without this the run stops "
+                         f"before the agent and exits {EXIT_UNCLEAN_SOURCE}, "
+                         f"because every image generated from that source "
+                         f"inherits the loss.")
     ap.add_argument("--reference-category",
                     help="Force the library subfolder step 0 searches "
                          "(e.g. bras, leggings) instead of letting the "
@@ -1590,8 +1712,37 @@ def main():
     if not args.no_reference_select:
         # Clean first, match second. The order is the point: the matcher has to
         # see the same image the rest of the pipeline works from.
-        clean = (None if args.no_pre_clean else
-                 pre_clean(workspace, run_dir, tools.python))
+        clean, clean_fails = ((None, []) if args.no_pre_clean else
+                              pre_clean(workspace, run_dir, tools.python))
+
+        # A failed outline gate parks the run HERE, before the agent gets a
+        # turn and before anything is billed. It used to be a printed warning
+        # that nothing acted on: one run's gate reported the bottom edge of the
+        # garment pulled in 16.7%, the pipeline carried on, and 150 cents of
+        # images were generated from a source the pipeline had already
+        # rejected. Everything downstream then inherited it - the description,
+        # the prompt, and a construction check that flagged all ten candidates
+        # for correctly dropping the pins the clean had failed to remove.
+        if clean_fails and not args.allow_dirty_source:
+            print(c(RED, "\npre-clean gate FAILED - the cleaned image is not "
+                         "the same garment."))
+            for f in clean_fails:
+                print(c(DIM, f"    {f}"))
+            print(c(DIM, f"  audit     {run_dir / 'archive' / 'clean_audit.json'}"))
+            print(c(DIM, f"  cleaned   {run_dir / 'archive' / 'offset_upload.jpg'}"
+                         f"  (written so it can be looked at)"))
+            print(c(DIM, "  The run stops before the agent starts, because "
+                         "every image generated from this source would inherit "
+                         "the loss and every check downstream would agree the "
+                         "garment always looked like this."))
+            print(c(DIM, "  --allow-dirty-source runs anyway; "
+                         "--no-pre-clean skips the clean entirely."))
+            return EXIT_UNCLEAN_SOURCE
+        if clean_fails:
+            print(c(YEL, "\n  --allow-dirty-source: continuing from a source "
+                         "the outline gate rejected."))
+            for f in clean_fails:
+                print(c(DIM, f"    {f}"))
         rc = select_reference(workspace, run_dir, tools.python,
                               args.reference_category, args.reference_threshold,
                               query=clean)
@@ -1690,6 +1841,12 @@ def main():
         raise
 
     dt = time.time() - t0
+
+    # Whatever the agent decided, paid-for images do not get abandoned.
+    forced = False
+    if args.ship_on_cap:
+        forced = force_ship(workspace, run_dir, tools.python, args.ship_on_cap)
+
     colour = {"done": GRN, "blocked": YEL}.get(result["status"], RED)
     print("\n" + c(BOLD, "─" * 60))
     print(c(colour, f"{result['status'].upper()}") +
@@ -1697,6 +1854,10 @@ def main():
                  f"  ·  {sess.compactions} compactions"))
     if result.get("summary"):
         print("\n" + textwrap.indent(textwrap.fill(result["summary"], 76), "  "))
+    if forced:
+        print(c(YEL, "\n  output/ was written by the harness, not by the agent. "
+                     "Nothing in the run's own LOG.md describes these picks - "
+                     "read grade_flats.py's output above for what each carries."))
     print(c(DIM, f"\n  transcript: {sess.log_path}"))
     if TR.path:
         print(c(DIM, f"  trace:      {TR.path}"))

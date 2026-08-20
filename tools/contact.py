@@ -27,7 +27,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw
 
 import common as C
@@ -51,19 +50,25 @@ def candidates(arch: Path, pattern: str | None):
     return sorted(p for p in (arch / f"{n}.png" for n in names) if p.exists())
 
 
-def garment_crop(path: Path, pad_frac: float = 0.02) -> Image.Image:
-    """The garment's own bounding box, with a little air around it."""
-    m, _ = C.garment_mask(path)
+def garment_crop(path: Path, pad_frac: float = 0.02,
+                 like: Path | None = None) -> Image.Image:
+    """The garment's own bounding box, with a little air around it.
+
+    `like` is the cleaned source. Passing it turns on the sanity check in
+    common.garment_box: a box that fills a wildly different share of its frame,
+    or has a wildly different aspect, is not used. Cells built without that
+    check are what turned a real sheet into five band close-ups at five
+    different magnifications, which is worse than useless - the sheet exists to
+    make candidates comparable, and every cell claimed to show a garment.
+    """
+    g = C.garment_box(path, like=like)
+    if not g["ok"]:
+        print(f"  {path.name}: {g['note']}")
     im = Image.open(path).convert("RGB")
-    ys, xs = np.nonzero(m)
-    if not len(xs):
-        return im
-    sx, sy = im.width / m.shape[1], im.height / m.shape[0]
+    x0, y0, x1, y1 = g["box"]
     pad = int(pad_frac * im.height)
-    return im.crop((max(0, int(xs.min() * sx) - pad),
-                    max(0, int(ys.min() * sy) - pad),
-                    min(im.width, int(xs.max() * sx) + pad),
-                    min(im.height, int(ys.max() * sy) + pad)))
+    return im.crop((max(0, x0 - pad), max(0, y0 - pad),
+                    min(im.width, x1 + pad), min(im.height, y1 + pad)))
 
 
 def build(cells, labels, out: Path, width: int) -> Image.Image:
@@ -105,6 +110,7 @@ def main_for(run: Path, per_sheet: int = 3, width: int = 1024,
     ref = reference or arch / "offset_upload.jpg"
     ref_cell = [garment_crop(ref)] if ref.exists() else []
     ref_lab = ["SOURCE"] if ref_cell else []
+    like = ref if ref.exists() else None
     import math
     n_sheets = max(1, math.ceil(len(cands) / per_sheet))
     base, extra = divmod(len(cands), n_sheets)
@@ -114,7 +120,7 @@ def main_for(run: Path, per_sheet: int = 3, width: int = 1024,
         batch = cands[i:i + size]
         i += size
         dst = arch / f"sheet_{k + 1}.jpg"
-        build(ref_cell + [garment_crop(p) for p in batch],
+        build(ref_cell + [garment_crop(p, like=like) for p in batch],
               ref_lab + [p.stem for p in batch], dst, width)
         out.append(dst)
     return out
@@ -145,6 +151,10 @@ def main() -> int:
     ref = a.reference or arch / "offset_upload.jpg"
     ref_cell = [garment_crop(ref)] if ref.exists() else []
     ref_lab = ["SOURCE"] if ref_cell else []
+    like = ref if ref.exists() else None
+    if like is None:
+        print("  no cleaned source to check the crops against; every box below "
+              "is taken on trust.")
 
     # Spread evenly across sheets. Fixed-size chunks left a remainder sheet
     # holding a single candidate, blown up to a different scale from every other
@@ -160,7 +170,7 @@ def main() -> int:
 
     made = []
     for n, batch in enumerate(groups, 1):
-        cells = ref_cell + [garment_crop(p) for p in batch]
+        cells = ref_cell + [garment_crop(p, like=like) for p in batch]
         labels = ref_lab + [p.stem for p in batch]
         out = arch / f"sheet_{n}.jpg"
         s = build(cells, labels, out, a.width)
