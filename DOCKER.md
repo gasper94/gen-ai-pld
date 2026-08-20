@@ -34,7 +34,7 @@ the container:
 | what | env var | default |
 |---|---|---|
 | text model (the agent) | `QWEN_BASE_URL` | `http://10.11.245.41:8091` |
-| vision model (step 0, grading) | `REFMATCH_BASE_URL` | `http://10.11.243.169:8080/v1` |
+| vision model (step 0, grading) | `REFMATCH_BASE_URL` | `http://10.11.245.41:8091/v1` |
 | fal.ai (the billed generation) | `FAL_KEY` | none - required |
 
 `QWEN_API_KEY` is read by both models. On the host it comes from `.qwen_key`;

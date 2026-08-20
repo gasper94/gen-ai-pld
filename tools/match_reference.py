@@ -80,7 +80,7 @@ def _default_base_url() -> str:
     appends /v1 itself, while everything here concatenates onto the URL as
     given. One shared variable meant one of the two was always wrong.
     """
-    url = os.environ.get("REFMATCH_BASE_URL", "http://10.11.243.169:8080/v1").rstrip("/")
+    url = os.environ.get("REFMATCH_BASE_URL", "http://10.11.245.41:8091/v1").rstrip("/")
     return url if url.endswith("/v1") else url + "/v1"
 
 
@@ -697,8 +697,19 @@ def main() -> int:
     ap.add_argument("--list-categories", action="store_true",
                     help="show the category subfolders found under --library and exit")
     ap.add_argument("--top-k", type=int, default=5)
-    ap.add_argument("--color-weight", type=float, default=2.0,
-                    help="0 = ignore colour, rank on cut/construction only")
+    # 0.5, not 2.0. select_reference.py desaturates the winner before installing
+    # it, precisely so the reference cannot act as a colour target - so colour
+    # must not dominate the choice of which garment to install. At 2.0 it
+    # outweighed neckline and strap_style, and a black/cream colour-blocked bra
+    # ranked its own style in navy 5th, below three solid-colour V-necks that
+    # merely shared a neckline. Stage C then rejected those, correctly, and the
+    # run stopped with the right answer sitting unexamined below the threshold.
+    # Kept non-zero: colourway is still a weak tiebreak between otherwise
+    # identical cuts.
+    ap.add_argument("--color-weight", type=float, default=0.5,
+                    help="0 = ignore colour, rank on cut/construction only "
+                         "(default 0.5: the installed reference is desaturated, "
+                         "so colour is a tiebreak, not a driver)")
     ap.add_argument("--threshold", "--min-score", type=float, default=90.0,
                     metavar="SCORE",
                     help="minimum score to count as a match; below it the run "
