@@ -170,6 +170,25 @@ def garment_profile(run_dir: Path,
 # outline from the one every downstream measurement uses.
 PLATE_MARGIN = 18.0
 
+# ...but 18 is a FLOOR, not the rule. It hugs the plate, which is right for a
+# pale garment a few levels below it and wrong for a dark one, because
+# everything between the two - including the garment's own contact shadow - then
+# counts as garment.
+#
+# Measured on the black-and-cream bra: plate 209, garment core 52. At `plate -
+# 18` the mask's bottom rows run 161, 186, 188 - shadow, not fabric, sitting
+# nearly at plate level. They put the source outline 16 rows below the real hem.
+# Matting then removes the shadow, as it should, and the outline gate reads the
+# difference as the garment losing its bottom edge: "bottom edge pulled in 3.0%
+# (limit 2%)", "outline lost 10.4% (limit 10%)". Both hairline, both false, and
+# both fatal to the run.
+#
+# So the threshold sits a fraction of the way from the plate towards the
+# garment's own tone. A pale garment (contrast ~25) keeps the 18 floor; a black
+# one on a light bench (contrast 158) gets 55, which is below any penumbra and
+# far above the fabric.
+SHADOW_FRAC = 0.35
+
 # The same question asked in colour instead of brightness: how far a pixel's own
 # colour cast has to sit from the plate's before it counts as garment, in 0-255
 # channel units.
@@ -341,7 +360,15 @@ def garment_evidence(path: Path, long_side: int = 1024,
     thr = max(CHROMA_MARGIN, noise + CHROMA_NOISE_PAD)
 
     chroma_mask = _blob(chroma > thr)
-    luma_mask = _blob(L < plate_L - PLATE_MARGIN)
+    # Two passes: the floor finds the garment, the garment's own tone then says
+    # where the fabric stops and its shadow starts. See SHADOW_FRAC.
+    luma_margin = PLATE_MARGIN
+    luma_mask = _blob(L < plate_L - luma_margin)
+    if luma_mask.any():
+        contrast_0 = plate_L - float(L[_core(luma_mask)].mean())
+        luma_margin = max(PLATE_MARGIN, SHADOW_FRAC * contrast_0)
+        if luma_margin > PLATE_MARGIN:
+            luma_mask = _blob(L < plate_L - luma_margin)
     inside = float(chroma[_core(chroma_mask)].mean()) if chroma_mask.any() else 0.0
 
     def plausible(m: np.ndarray) -> float:
@@ -362,7 +389,7 @@ def garment_evidence(path: Path, long_side: int = 1024,
     else:
         use_chroma, why = False, "neither cue is convincing"
 
-    cue_raw = (chroma > thr) if use_chroma else (L < plate_L - PLATE_MARGIN)
+    cue_raw = (chroma > thr) if use_chroma else (L < plate_L - luma_margin)
     mask = chroma_mask if use_chroma else luma_mask
     contrast = plate_L - float(L[_core(mask)].mean()) if mask.any() else 0.0
 
@@ -385,6 +412,7 @@ def garment_evidence(path: Path, long_side: int = 1024,
         "plate_level": plate_L,
         "chroma_threshold": round(thr, 2),
         "chroma_inside": round(inside, 2),
+        "luma_margin": round(luma_margin, 1),
         "luma_contrast": round(contrast, 1),
         "area": float(mask.mean()),
         "bbox": box,

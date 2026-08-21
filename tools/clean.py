@@ -119,7 +119,8 @@ def garment_colour(path: Path, cue: str | None = None) -> np.ndarray:
 
 def splice(full: Image.Image, erased: Image.Image, base: np.ndarray | None = None,
            plate: float | None = None, min_frac=2e-5, feather=6.0,
-           bad_frac=0.02, bad_abs=1e-4) -> tuple[Image.Image, float, list[dict]]:
+           bad_frac=0.02, bad_abs=1e-4,
+           margin: float = C.PLATE_MARGIN) -> tuple[Image.Image, float, list[dict]]:
     """Put ONLY the erased patch back into the full-resolution original.
 
     The eraser silently returns a much smaller image - measured 3072x4096 in,
@@ -172,8 +173,12 @@ def splice(full: Image.Image, erased: Image.Image, base: np.ndarray | None = Non
         slop = max(4, 2 * scale)
         inside = ndimage.binary_erosion(big, np.ones((slop, slop)))
         outside = ~ndimage.binary_dilation(big, np.ones((slop, slop)))
-        was_fabric = a.mean(axis=2) < plate - C.PLATE_MARGIN
-        now_plate = b.mean(axis=2) > plate - C.PLATE_MARGIN
+        # The SAME margin the mask was built with. A guard that draws the line
+        # between fabric and plate somewhere else from the outline it is
+        # policing is guarding a different garment - which is the whole reason
+        # PLATE_MARGIN was given a name in the first place.
+        was_fabric = a.mean(axis=2) < plate - margin
+        now_plate = b.mean(axis=2) > plate - margin
         deletes = inside & was_fabric & now_plate
         invents = outside & ~was_fabric & ~now_plate
 
@@ -319,7 +324,8 @@ def vision_verdict(before: Path, after: Path, base_url: str, model: str,
 
 def clean_once(staged: Path, out: Path, arch: Path, remove: str, icc,
                base: np.ndarray, plate: float, before: np.ndarray,
-               fal_client, requests, cue: str | None = None) -> dict:
+               fal_client, requests, cue: str | None = None,
+               margin: float = C.PLATE_MARGIN) -> dict:
     """One full pass: optional erase, then matte onto white. Writes `out`.
 
     `cue` is how the garment was found in the SOURCE, and everything measured
@@ -338,7 +344,8 @@ def clean_once(staged: Path, out: Path, arch: Path, remove: str, icc,
             raise RuntimeError("object-removal returned no image")
         img = Image.open(requests.get(items[0]["url"], stream=True,
                                       timeout=300).raw).convert("RGB")
-        spliced, patch, rejects = splice(work, img, base=base, plate=plate)
+        spliced, patch, rejects = splice(work, img, base=base, plate=plate,
+                                         margin=margin)
         cur = arch / "_clean_erased.png"
         spliced.save(cur)
         after = garment_colour(cur, cue)
@@ -459,8 +466,9 @@ def main() -> int:
           f"garment RGB {before.round(0).tolist()}")
     print(f"              plate level {plate:.0f}, garment {src_sil['area']*100:.1f}% "
           f"of frame, outline bbox {src_sil['bbox']}")
-    print(f"              found by {cue} ({src_ev['cue_why']}); everything below "
-          f"is measured the same way")
+    print(f"              found by {cue} ({src_ev['cue_why']}), fabric/plate line "
+          f"at {src_ev['luma_margin']:.0f} below plate; everything below is "
+          f"measured the same way")
     if a.no_guard:
         print("              GUARD OFF - the eraser may change the outline")
 
@@ -481,7 +489,7 @@ def main() -> int:
         try:
             info = clean_once(staged, out, arch, remove, icc, None if a.no_guard
                               else base, plate, before, fal_client, requests,
-                              cue=cue)
+                              cue=cue, margin=src_ev["luma_margin"])
         except RuntimeError as e:
             print(e)
             return 1
