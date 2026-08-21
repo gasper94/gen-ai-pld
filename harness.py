@@ -1606,21 +1606,34 @@ def main():
                     help="Force the library subfolder step 0 searches "
                          "(e.g. bras, leggings) instead of letting the "
                          "off-set photo's own garment type pick it.")
-    # 87, not the matcher's own 90. A periwinkle sports bra scored 89.2 against
-    # a library piece that agreed on garment type, neckline, strap style and
-    # finish and differed only in colour - and colour is the heaviest term in
-    # the score (weight 2.0) while select_reference.py desaturates the winner
-    # before installing it. So the run was stopped by the one attribute the
-    # pipeline throws away. 87 clears a construction-identical, wrong-colour
-    # match and still sits well above the 81.1 band where strap style and
-    # neckline start to disagree.
+    # 95: an operator decision to take the near-miss out of the reference slot
+    # entirely. A wrong reference is not a cheap error - it is the image every
+    # candidate is laid against, and on this project it has bled a V-neckline
+    # and seam piping into four of ten generations at 15c each. Parking the run
+    # and asking for a hero costs nothing by comparison.
+    #
+    # What it gives up, so the trade is on the record rather than rediscovered.
+    # It was 87 for a measured reason: a periwinkle sports bra scored 89.2
+    # against a library piece that agreed on garment type, neckline, strap style
+    # and finish and differed only in COLOUR - the heaviest term in the score
+    # (weight 2.0) - while select_reference.py desaturates the winner before
+    # installing it. At 95 that match is refused on the one attribute the
+    # pipeline throws away.
+    #
+    # And the score is not as stable as a 95 gate assumes. The same library
+    # image scored 99.2 against one cleaned copy of a garment and 81.6 against
+    # another copy of the SAME garment, because the query's attributes are
+    # re-extracted per image. One real batch clears 95 with 4.2 points to
+    # spare; another clears it by 0.2. Expect no-match parks, and read
+    # result_top_matches.jpg before assuming the library has nothing.
     #
     # Only reference SELECTION moves. match_reference.py keeps 90 for a direct
     # call, where the caller is asking "is this the same garment?" rather than
     # "is this close enough in shape to lay against?".
-    ap.add_argument("--reference-threshold", type=float, default=87.0,
+    ap.add_argument("--reference-threshold", type=float, default=95.0,
                     help="Score a library image must reach to be installed as "
-                         "the reference (default 87).")
+                         "the reference (default 95). Lower it to 87 to accept "
+                         "a construction-identical, wrong-colour match.")
     ap.add_argument("--allow-no-reference", action="store_true",
                     help="Start the agent even when step 0 found no matching "
                          "reference. Off by default: the run would be measured "

@@ -94,7 +94,10 @@ actually failing, so the two are never in the same list. Flags:
     --no-pre-clean               match against the raw input; prepare.py then
                                  cleans on the agent's first turn as before
     --reference-category bras    force the library subfolder
-    --reference-threshold 85     lower the pass mark (default 87)
+    --reference-threshold 87     lower the pass mark (default 95). 87 accepts a
+                                 construction-identical match that differs only
+                                 in colour, which the reference is desaturated
+                                 to discard anyway
     --allow-no-reference         start anyway, with no match
 
 Or run it by hand:
